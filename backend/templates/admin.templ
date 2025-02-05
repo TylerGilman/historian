@@ -1,0 +1,27 @@
+package templates
+
+import (
+    "io"
+    "github.com/a-h/templ"
+)
+
+templ Admin(users []User) {
+    @Base("Admin", templ.ComponentFunc(func(w io.Writer) error {
+        <div class="admin-container">
+            <h1>Admin Dashboard</h1>
+            <h2>Users</h2>
+            <ul>
+                for _, user := range users {
+                    <li>{ user.Email } - { user.Role }</li>
+                }
+            </ul>
+            <h2>Add User</h2>
+            <form hx-post="/api/auth/users" hx-swap="none">
+                <input type="email" name="email" placeholder="Email" required />
+                <input type="password" name="password" placeholder="Password" required />
+                <button type="submit">Add User</button>
+            </form>
+        </div>
+        return nil
+    }))
+}
