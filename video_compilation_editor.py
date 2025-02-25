@@ -52,6 +52,7 @@ from PyQt5.QtCore import (
     QMetaObject,
     Q_ARG,
     QRect,
+    QTimer,
 )
 from PyQt5.QtGui import QIcon, QFont, QPalette, QColor, QPainter, QPen
 
@@ -145,7 +146,7 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 0  # Default manual rotation (0 degrees)
+        self.manual_rotation = 90  # Default manual rotation (90 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
@@ -1014,76 +1015,95 @@ class ProcessingWorker(QObject):
                         try:
                             # Copy the file first - safer approach
                             shutil.copy(valid_files[0], output_file)
-                            
+
                             # For a single video, use a simpler approach to add music
                             # This reduces the chance of a segfault
                             temp_music_file = os.path.join(
                                 TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
                             )
-                            
+
                             # First, create a combined music file if multiple tracks
                             if len(self.music_tracks) > 1:
                                 # Build command to mix music tracks
                                 music_cmd = ["ffmpeg", "-y", "-v", "error"]
                                 music_filter = ""
-                                
+
                                 # Add inputs
                                 valid_track_count = 0
                                 for track in self.music_tracks:
                                     if os.path.exists(track.file_path):
                                         music_cmd.extend(["-i", track.file_path])
                                         valid_track_count += 1
-                                
+
                                 if valid_track_count == 0:
                                     # No valid music tracks, just return video
                                     return (output_file, total_duration)
-                                    
+
                                 # Create filter for mixing
                                 for i in range(valid_track_count):
-                                    music_filter += f"[{i}:a]volume={self.music_tracks[i].volume},"
-                                    
+                                    music_filter += (
+                                        f"[{i}:a]volume={self.music_tracks[i].volume},"
+                                    )
+
                                     # Apply trim if needed
-                                    if (self.music_tracks[i].start_time_in_track > 0 or 
-                                        self.music_tracks[i].duration):
+                                    if (
+                                        self.music_tracks[i].start_time_in_track > 0
+                                        or self.music_tracks[i].duration
+                                    ):
                                         music_filter += f"atrim=start={self.music_tracks[i].start_time_in_track}"
                                         if self.music_tracks[i].duration:
                                             music_filter += f":duration={self.music_tracks[i].duration}"
                                         music_filter += ","
-                                    
+
                                     # End this input's processing
                                     music_filter += f"aformat=sample_fmts=fltp[a{i}];"
-                                
+
                                 # Mix all inputs
-                                music_filter += "".join(f"[a{i}]" for i in range(valid_track_count))
+                                music_filter += "".join(
+                                    f"[a{i}]" for i in range(valid_track_count)
+                                )
                                 music_filter += f"amix=inputs={valid_track_count}:duration=longest[aout]"
-                                
+
                                 # Finalize command
-                                music_cmd.extend([
-                                    "-filter_complex", music_filter,
-                                    "-map", "[aout]",
-                                    "-c:a", "mp3",
-                                    "-b:a", "192k",
-                                    temp_music_file
-                                ])
-                                
+                                music_cmd.extend(
+                                    [
+                                        "-filter_complex",
+                                        music_filter,
+                                        "-map",
+                                        "[aout]",
+                                        "-c:a",
+                                        "mp3",
+                                        "-b:a",
+                                        "192k",
+                                        temp_music_file,
+                                    ]
+                                )
+
                                 # Run music mix command with timeout
                                 try:
                                     music_process = subprocess.Popen(
-                                        music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                        music_cmd,
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE,
+                                        text=True,
                                     )
-                                    
+
                                     # Wait with timeout
                                     start_time = time.time()
                                     while music_process.poll() is None:
-                                        if time.time() - start_time > 60:  # 60 second timeout
+                                        if (
+                                            time.time() - start_time > 60
+                                        ):  # 60 second timeout
                                             music_process.terminate()
                                             print("Music mixing timed out")
                                             break
                                         time.sleep(0.1)
-                                    
+
                                     # Check result
-                                    if (not os.path.exists(temp_music_file) or 
-                                        os.path.getsize(temp_music_file) < 1000):
+                                    if (
+                                        not os.path.exists(temp_music_file)
+                                        or os.path.getsize(temp_music_file) < 1000
+                                    ):
                                         print("Failed to create mixed music file")
                                         # Return video without music
                                         return (output_file, total_duration)
@@ -1098,52 +1118,79 @@ class ProcessingWorker(QObject):
                                 else:
                                     # No valid music track
                                     return (output_file, total_duration)
-                            
+
                             # Now add the music to the video
                             music_add_cmd = [
-                                "ffmpeg", "-y", "-v", "error",
-                                "-i", output_file,
-                                "-i", temp_music_file,
-                                "-filter_complex", "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                                "-map", "0:v", "-map", "[a]",
-                                "-c:v", "copy",
-                                "-c:a", "aac", "-b:a", "128k",
-                                "-shortest"
+                                "ffmpeg",
+                                "-y",
+                                "-v",
+                                "error",
+                                "-i",
+                                output_file,
+                                "-i",
+                                temp_music_file,
+                                "-filter_complex",
+                                "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "[a]",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                                "-shortest",
                             ]
-                            
+
                             # Create final output file
                             final_output = os.path.join(
                                 TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
                             )
                             music_add_cmd.append(final_output)
-                            
+
                             # Run command with timeout
                             try:
                                 add_process = subprocess.Popen(
-                                    music_add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                    music_add_cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True,
                                 )
-                                
+
                                 # Wait with timeout
                                 start_time = time.time()
                                 while add_process.poll() is None:
-                                    if time.time() - start_time > 60:  # 60 second timeout
+                                    if (
+                                        time.time() - start_time > 60
+                                    ):  # 60 second timeout
                                         add_process.terminate()
                                         print("Music addition timed out")
                                         break
                                     time.sleep(0.1)
-                                
+
                                 # Check result
-                                if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                                if (
+                                    os.path.exists(final_output)
+                                    and os.path.getsize(final_output) > 1000
+                                ):
                                     # Success - clean up and return
-                                    os.unlink(output_file)  # Remove the non-music version
-                                    
+                                    os.unlink(
+                                        output_file
+                                    )  # Remove the non-music version
+
                                     # Clean up temp music file if we created it
-                                    if len(self.music_tracks) > 1 and temp_music_file != self.music_tracks[0].file_path:
+                                    if (
+                                        len(self.music_tracks) > 1
+                                        and temp_music_file
+                                        != self.music_tracks[0].file_path
+                                    ):
                                         try:
                                             os.unlink(temp_music_file)
                                         except:
                                             pass
-                                    
+
                                     # Clean up temp files
                                     for file in valid_files:
                                         try:
@@ -1151,8 +1198,10 @@ class ProcessingWorker(QObject):
                                                 os.unlink(file)
                                         except:
                                             pass
-                                    
-                                    self.progress.emit(100, "Preview ready (with music)")
+
+                                    self.progress.emit(
+                                        100, "Preview ready (with music)"
+                                    )
                                     return (final_output, total_duration)
                             except Exception as e:
                                 print(f"Error adding music to video: {str(e)}")
@@ -1164,7 +1213,7 @@ class ProcessingWorker(QObject):
                         try:
                             # Copy file first
                             shutil.copy(valid_files[0], output_file)
-                            
+
                             # Create music command
                             music_cmd = [
                                 "ffmpeg",
@@ -1186,20 +1235,23 @@ class ProcessingWorker(QObject):
                                 "-c:a",
                                 "aac",
                                 "-b:a",
-                                "128k"
+                                "128k",
                             ]
-                            
+
                             # Create final output
                             final_output = os.path.join(
                                 TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
                             )
                             music_cmd.append(final_output)
-                            
+
                             # Run command
                             process = subprocess.Popen(
-                                music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                music_cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True,
                             )
-                            
+
                             # Monitor with timeout
                             start_time = time.time()
                             while process.poll() is None:
@@ -1211,18 +1263,21 @@ class ProcessingWorker(QObject):
                                     except:
                                         pass
                                     return "Aborted"
-                                
+
                                 if time.time() - start_time > 60:
                                     process.terminate()
                                     break
-                                
+
                                 time.sleep(0.1)
-                            
+
                             # Check if successful
-                            if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                            if (
+                                os.path.exists(final_output)
+                                and os.path.getsize(final_output) > 1000
+                            ):
                                 # Success - clean up and return
                                 os.unlink(output_file)  # Remove non-music version
-                                
+
                                 # Clean up temp files
                                 for file in valid_files:
                                     try:
@@ -1230,7 +1285,7 @@ class ProcessingWorker(QObject):
                                             os.unlink(file)
                                     except:
                                         pass
-                                
+
                                 self.progress.emit(100, "Preview ready (with music)")
                                 return (final_output, total_duration)
                         except Exception as e:
@@ -1241,12 +1296,18 @@ class ProcessingWorker(QObject):
                 # Just return the copy of the single clip
                 try:
                     # Make sure we have a copy of the file
-                    if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
+                    if (
+                        not os.path.exists(output_file)
+                        or os.path.getsize(output_file) < 1000
+                    ):
                         shutil.copy(valid_files[0], output_file)
-                    
-                    if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+
+                    if (
+                        os.path.exists(output_file)
+                        and os.path.getsize(output_file) > 1000
+                    ):
                         self.progress.emit(100, "Preview ready (single clip)")
-                        
+
                         # Clean up temp files
                         for file in valid_files:
                             try:
@@ -1254,7 +1315,7 @@ class ProcessingWorker(QObject):
                                     os.unlink(file)
                             except:
                                 pass
-                        
+
                         return (output_file, total_duration)
                 except Exception as e:
                     print(f"Error copying single file: {str(e)}")
@@ -1345,91 +1406,108 @@ class ProcessingWorker(QObject):
                 os.unlink(file_list)
 
             # Add background music if provided
-            if (
-                os.path.exists(output_file)
-                and os.path.getsize(output_file) > 1000
-            ):
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
                 # Check if we have music tracks or legacy music file
                 if self.music_tracks or (
                     self.music_file and os.path.exists(self.music_file)
                 ):
                     self.progress.emit(90, "Adding background music...")
                     # Use a simpler approach for adding music to avoid segfault
-                    
+
                     try:
                         # Create a combined music file if needed
                         temp_music_file = os.path.join(
                             TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
                         )
-                        
+
                         if self.music_tracks and len(self.music_tracks) > 0:
                             # If multiple tracks, mix them first
                             if len(self.music_tracks) > 1:
                                 # Mix all music tracks to a single file
                                 music_cmd = ["ffmpeg", "-y", "-v", "error"]
                                 music_inputs = []
-                                
+
                                 # Add all valid tracks
                                 valid_tracks = []
                                 for track in self.music_tracks:
                                     if os.path.exists(track.file_path):
                                         music_cmd.extend(["-i", track.file_path])
                                         valid_tracks.append(track)
-                                
+
                                 if not valid_tracks:
                                     # No valid music, skip music addition
-                                    self.progress.emit(100, "Preview ready (no music available)")
+                                    self.progress.emit(
+                                        100, "Preview ready (no music available)"
+                                    )
                                     return (output_file, total_duration)
-                                
+
                                 # Create filter string
                                 filter_str = ""
                                 for i, track in enumerate(valid_tracks):
-                                    # Base volume adjustment 
+                                    # Base volume adjustment
                                     filter_str += f"[{i}:a]volume={track.volume}"
-                                    
+
                                     # Add trim if needed
                                     if track.start_time_in_track > 0 or track.duration:
-                                        filter_str += f",atrim=start={track.start_time_in_track}"
+                                        filter_str += (
+                                            f",atrim=start={track.start_time_in_track}"
+                                        )
                                         if track.duration:
                                             filter_str += f":duration={track.duration}"
-                                    
+
                                     # Add delay for start_time_in_compilation
                                     if track.start_time_in_compilation > 0:
                                         filter_str += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
-                                    
+
                                     # End this input
                                     filter_str += f"[a{i}];"
-                                
+
                                 # Mix all inputs
-                                filter_str += "".join(f"[a{i}]" for i in range(len(valid_tracks)))
+                                filter_str += "".join(
+                                    f"[a{i}]" for i in range(len(valid_tracks))
+                                )
                                 filter_str += f"amix=inputs={len(valid_tracks)}:duration=longest[aout]"
-                                
+
                                 # Complete command
-                                music_cmd.extend([
-                                    "-filter_complex", filter_str,
-                                    "-map", "[aout]",
-                                    "-c:a", "mp3",
-                                    "-b:a", "192k",
-                                    temp_music_file
-                                ])
-                                
+                                music_cmd.extend(
+                                    [
+                                        "-filter_complex",
+                                        filter_str,
+                                        "-map",
+                                        "[aout]",
+                                        "-c:a",
+                                        "mp3",
+                                        "-b:a",
+                                        "192k",
+                                        temp_music_file,
+                                    ]
+                                )
+
                                 # Run with timeout
                                 music_process = subprocess.Popen(
-                                    music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                    music_cmd,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    text=True,
                                 )
-                                
+
                                 start_time = time.time()
                                 while music_process.poll() is None:
                                     if time.time() - start_time > 60:
                                         music_process.terminate()
                                         print("Music mixing timed out")
                                         # Skip music addition
-                                        self.progress.emit(100, "Preview ready (music mixing failed)")
+                                        self.progress.emit(
+                                            100, "Preview ready (music mixing failed)"
+                                        )
                                         return (output_file, total_duration)
                                     time.sleep(0.1)
-                                    
+
                                 # Check result
-                                if not os.path.exists(temp_music_file) or os.path.getsize(temp_music_file) < 1000:
+                                if (
+                                    not os.path.exists(temp_music_file)
+                                    or os.path.getsize(temp_music_file) < 1000
+                                ):
                                     # Failed to create mixed music
                                     self.progress.emit(100, "Preview ready (no music)")
                                     return (output_file, total_duration)
@@ -1443,34 +1521,50 @@ class ProcessingWorker(QObject):
                             # No valid music
                             self.progress.emit(100, "Preview ready (no music)")
                             return (output_file, total_duration)
-                        
+
                         # Now add the music to the video
                         final_output = os.path.join(
                             TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
                         )
-                        
+
                         # Simple filter for adding music
                         volume = self.music_volume
                         if self.music_tracks and len(self.music_tracks) > 0:
                             volume = 0.7  # Default if we mixed tracks
-                        
+
                         add_cmd = [
-                            "ffmpeg", "-y", "-v", "error",
-                            "-i", output_file,
-                            "-i", temp_music_file,
-                            "-filter_complex", f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                            "-map", "0:v", "-map", "[a]",
-                            "-c:v", "copy",
-                            "-c:a", "aac", "-b:a", "128k",
+                            "ffmpeg",
+                            "-y",
+                            "-v",
+                            "error",
+                            "-i",
+                            output_file,
+                            "-i",
+                            temp_music_file,
+                            "-filter_complex",
+                            f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map",
+                            "0:v",
+                            "-map",
+                            "[a]",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
                             "-shortest",
-                            final_output
+                            final_output,
                         ]
-                        
+
                         # Run with timeout
                         add_process = subprocess.Popen(
-                            add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                            add_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
                         )
-                        
+
                         start_time = time.time()
                         while add_process.poll() is None:
                             if self._abort:
@@ -1481,30 +1575,36 @@ class ProcessingWorker(QObject):
                                 except:
                                     pass
                                 return "Aborted"
-                                
+
                             if time.time() - start_time > 60:
                                 add_process.terminate()
                                 print("Music addition timed out")
                                 break
-                                
+
                             time.sleep(0.1)
-                        
+
                         # Check result
-                        if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                        if (
+                            os.path.exists(final_output)
+                            and os.path.getsize(final_output) > 1000
+                        ):
                             # Success! Use the music version
                             try:
                                 # Remove original
                                 if os.path.exists(output_file):
                                     os.unlink(output_file)
-                                    
+
                                 # Clean up temp music file if we created it
-                                if (self.music_tracks and len(self.music_tracks) > 1 and 
-                                    temp_music_file != self.music_file):
+                                if (
+                                    self.music_tracks
+                                    and len(self.music_tracks) > 1
+                                    and temp_music_file != self.music_file
+                                ):
                                     try:
                                         os.unlink(temp_music_file)
                                     except:
                                         pass
-                                    
+
                                 # Use the music version
                                 output_file = final_output
                             except Exception as e:
@@ -2143,9 +2243,8 @@ class TimelineWidget(QWidget):
         self.current_position = 0
         self.setMinimumHeight(70)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-
         # Scroll and zoom properties
-        self.scroll_offset = 0  # In pixels
+        self.scroll_offset = -1  # In pixels
         self.zoom_level = 1.0  # Scale factor (1.0 = fit all clips)
         self.pixels_per_second = 50  # Base scale when zoom is 1.0
         self.dragging = False
@@ -2162,31 +2261,12 @@ class TimelineWidget(QWidget):
         # Ensure the widget can receive focus for key events
         self.setFocusPolicy(Qt.StrongFocus)
 
-    def set_clips(self, clips):
-        """Set the clips to display"""
-        self.clips = clips
-        self.total_duration = sum(clip.get("duration", 0) for clip in clips)
-        
-        # Adjust zoom level to fit all clips if needed
-        if self.total_duration > 0 and self.width() > 0:
-            min_zoom = max(0.2, self.width() / (self.total_duration * self.pixels_per_second))
-            if self.zoom_level < min_zoom:
-                self.zoom_level = min_zoom
-        
-        self.update()
-
-    def set_music_tracks(self, tracks):
-        """Set music tracks to display in timeline"""
-        self.music_tracks = tracks
-        self.update()
-
     def set_position(self, position):
         """Set the current playback position in seconds"""
         self.current_position = position
 
         # Auto-scroll to keep playback position visible
         if self.clips and self.total_duration > 0:
-            # Calculate visible region based on current scroll and widget width
             pixels_per_second = self.pixels_per_second * self.zoom_level
             widget_width = self.width()
 
@@ -2196,8 +2276,30 @@ class TimelineWidget(QWidget):
             # Check if position is outside visible area
             if position_x < 0 or position_x > widget_width:
                 # Center the position in the viewport
-                self.scroll_offset = max(0, position * pixels_per_second - widget_width / 2)
+                self.scroll_offset = max(
+                    0, position * pixels_per_second - widget_width / 2
+                )
 
+        self.update()
+
+    def set_clips(self, clips):
+        """Set the clips to display"""
+        self.clips = clips
+        self.total_duration = sum(clip.get("duration", 0) for clip in clips)
+
+        # Adjust zoom level to fit all clips if needed
+        if self.total_duration > 0 and self.width() > 0:
+            min_zoom = max(
+                0.2, self.width() / (self.total_duration * self.pixels_per_second)
+            )
+            if self.zoom_level < min_zoom:
+                self.zoom_level = min_zoom
+
+        self.update()
+
+    def set_music_tracks(self, tracks):
+        """Set music tracks to display in timeline"""
+        self.music_tracks = tracks
         self.update()
 
     def set_pending_changes(self, has_changes):
@@ -2207,7 +2309,10 @@ class TimelineWidget(QWidget):
 
     def timeline_width(self):
         """Calculate the total width of the timeline in pixels based on zoom"""
-        return max(self.width(), int(self.total_duration * self.pixels_per_second * self.zoom_level))
+        return max(
+            self.width(),
+            int(self.total_duration * self.pixels_per_second * self.zoom_level),
+        )
 
     def seconds_to_pixels(self, seconds):
         """Convert a time in seconds to pixels based on current zoom"""
@@ -2250,7 +2355,9 @@ class TimelineWidget(QWidget):
         else:
             # For hover effects, determine which clip is under the cursor
             self.hover_x = event.x()
-            self.hover_clip_index = self.get_clip_at_position(int(event.x() + self.scroll_offset))
+            self.hover_clip_index = self.get_clip_at_position(
+                int(event.x() + self.scroll_offset)
+            )
             self.update()
 
         super().mouseMoveEvent(event)
@@ -2340,7 +2447,7 @@ class TimelineWidget(QWidget):
         music_height = 0
         if self.music_tracks:
             music_height = min(height * 0.25, 20 * len(self.music_tracks))
-        
+
         main_clip_height = height - music_height - 5 if music_height > 0 else height
 
         # Draw clips with offset for scrolling
@@ -2396,13 +2503,17 @@ class TimelineWidget(QWidget):
 
             # Draw clip name (truncated if needed)
             clip_name = clip.get("name", "")
-            name_rect = QRect(x + 5, int(main_clip_height) // 2 - 10, clip_width - 10, 20)
+            name_rect = QRect(
+                x + 5, int(main_clip_height) // 2 - 10, clip_width - 10, 20
+            )
             font = painter.font()
             font.setBold(True)
             painter.setFont(font)
 
             if clip_width > 60:  # Only draw name if clip is wide enough
-                name = painter.fontMetrics().elidedText(clip_name, Qt.ElideMiddle, clip_width - 10)
+                name = painter.fontMetrics().elidedText(
+                    clip_name, Qt.ElideMiddle, clip_width - 10
+                )
                 painter.drawText(name_rect, Qt.AlignCenter, name)
 
             # Draw duration
@@ -2422,15 +2533,28 @@ class TimelineWidget(QWidget):
                     # Draw time indicator
                     painter.setPen(QPen(QColor(255, 165, 0), 2))  # Orange line
                     hover_x_pos = int(x + hover_pos)
-                    painter.drawLine(hover_x_pos, 5, hover_x_pos, int(main_clip_height - 5))
-
+                    painter.drawLine(
+                        hover_x_pos, 5, hover_x_pos, int(main_clip_height - 5)
+                    )
 
                     # Draw time label
                     time_label = f"{self.format_time(absolute_time)}"
-                    painter.fillRect(hover_x_pos - 40, int(main_clip_height - 30), 80, 20, QColor(0, 0, 0, 180))
+                    painter.fillRect(
+                        hover_x_pos - 40,
+                        int(main_clip_height - 30),
+                        80,
+                        20,
+                        QColor(0, 0, 0, 180),
+                    )
                     painter.setPen(QColor(255, 165, 0))
-                    painter.drawText(hover_x_pos - 40, int(main_clip_height - 30), 80, 20, Qt.AlignCenter, time_label)
-
+                    painter.drawText(
+                        hover_x_pos - 40,
+                        int(main_clip_height - 30),
+                        80,
+                        20,
+                        Qt.AlignCenter,
+                        time_label,
+                    )
 
             x += clip_width
 
@@ -2438,49 +2562,65 @@ class TimelineWidget(QWidget):
         if self.music_tracks and music_height > 0:
             track_height = music_height / len(self.music_tracks)
             y_offset = main_clip_height + 5
-            
+
             # Draw music track background
-            painter.fillRect(0, int(y_offset), int(width), int(music_height), QColor(40, 40, 40))
-            
+            painter.fillRect(
+                0, int(y_offset), int(width), int(music_height), QColor(40, 40, 40)
+            )
+
             # Draw track separator
             painter.setPen(QPen(QColor(60, 60, 60), 1))
             painter.drawLine(0, int(y_offset), int(width), int(y_offset))
-            
+
             # Draw each track
             for i, track in enumerate(self.music_tracks):
                 track_y = y_offset + i * track_height
-                
+
                 # Calculate start and end in pixels
-                start_px = self.seconds_to_pixels(track.start_time_in_compilation) - self.scroll_offset
-                duration = track.duration or (track.total_duration - track.start_time_in_track)
+                start_px = (
+                    self.seconds_to_pixels(track.start_time_in_compilation)
+                    - self.scroll_offset
+                )
+                duration = track.duration or (
+                    track.total_duration - track.start_time_in_track
+                )
                 end_px = start_px + self.seconds_to_pixels(duration)
-                
+
                 # Draw track if visible
                 if end_px >= 0 and start_px < width:
                     # Draw track background
                     track_rect = QRect(
-                        int(max(0, start_px)), 
-                        int(track_y), 
-                        int(min(width, end_px) - max(0, start_px)), 
-                        int(track_height)
+                        int(max(0, start_px)),
+                        int(track_y),
+                        int(min(width, end_px) - max(0, start_px)),
+                        int(track_height),
                     )
-                    
-                    painter.fillRect(track_rect, QColor(150, 100, 200, 180))  # Purple for music
-                    
+
+                    painter.fillRect(
+                        track_rect, QColor(150, 100, 200, 180)
+                    )  # Purple for music
+
                     # Draw track name if wide enough
                     if track_rect.width() > 60:
                         painter.setPen(QColor(255, 255, 255))
                         track_name = os.path.basename(track.file_path)
-                        name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_rect.width() - 10)
+                        name = painter.fontMetrics().elidedText(
+                            track_name, Qt.ElideMiddle, track_rect.width() - 10
+                        )
                         painter.drawText(
-                            int(track_rect.x() + 4), 
-                            int(track_rect.y() + track_height / 2 + 5), 
-                            name
+                            int(track_rect.x() + 4),
+                            int(track_rect.y() + track_height / 2 + 5),
+                            name,
                         )
 
         # Draw current position marker
-        if self.total_duration > 0 and 0 <= self.current_position <= self.total_duration:
-            pos_x = int(self.current_position * pixels_per_second) - int(self.scroll_offset)
+        if (
+            self.total_duration > 0
+            and 0 <= self.current_position <= self.total_duration
+        ):
+            pos_x = int(self.current_position * pixels_per_second) - int(
+                self.scroll_offset
+            )
 
             if 0 <= pos_x <= width:
                 painter.setPen(QPen(QColor(255, 0, 0), 2))
@@ -2491,17 +2631,26 @@ class TimelineWidget(QWidget):
 
                 # Position text background
                 text_width = 80
-                painter.fillRect(pos_x - text_width // 2, 2, text_width, 20, QColor(0, 0, 0, 180))
+                painter.fillRect(
+                    pos_x - text_width // 2, 2, text_width, 20, QColor(0, 0, 0, 180)
+                )
 
                 painter.setPen(QColor(255, 0, 0))
-                painter.drawText(pos_x - text_width // 2, 2, text_width, 20, Qt.AlignCenter, position_text)
+                painter.drawText(
+                    pos_x - text_width // 2,
+                    2,
+                    text_width,
+                    20,
+                    Qt.AlignCenter,
+                    position_text,
+                )
 
         # Draw pending changes indicator
         if self.has_pending_changes:
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(255, 0, 0, 180))
             painter.drawRect(width - 15, 5, 10, 10)
-            
+
         # Draw zoom level indicator
         zoom_text = f"Zoom: {self.zoom_level:.1f}x"
         painter.setPen(QColor(200, 200, 200))
@@ -2750,7 +2899,7 @@ class EffectsDialog(QDialog):
 
         # Add the new effect
         self.media_item.effects.append(effect)
-        
+
         # Mark item as having pending changes
         self.media_item.has_pending_changes = True
 
@@ -2934,12 +3083,14 @@ class MusicEditorDialog(QDialog):
 
         # Draw time markers
         painter.setPen(QPen(QColor(100, 100, 100), 1, Qt.DotLine))
-        interval = max(1, int(self.total_video_duration / 10))  # Divide into ~10 segments
+        interval = max(
+            1, int(self.total_video_duration / 10)
+        )  # Divide into ~10 segments
 
         for t in range(0, int(self.total_video_duration) + interval, interval):
             x = int((t / self.total_video_duration) * width)
             painter.drawLine(x, 0, x, height)
-            
+
             # Draw time label
             minutes = t // 60
             seconds = t % 60
@@ -2950,41 +3101,51 @@ class MusicEditorDialog(QDialog):
 
         # Draw tracks
         track_height = min(height / max(1, len(self.music_tracks)), 25)
-        
+
         for i, track in enumerate(self.music_tracks):
             y = int(i * track_height + 20)  # Start below time markers, convert to int
-            
+
             # Calculate track position
-            start_x = int((track.start_time_in_compilation / self.total_video_duration) * width)
-            
+            start_x = int(
+                (track.start_time_in_compilation / self.total_video_duration) * width
+            )
+
             # Calculate duration - either specified or remainder of track
             if track.duration:
                 duration = track.duration
             else:
                 duration = track.total_duration - track.start_time_in_track
-                
+
             # Limit by video length
-            end_x = int(((track.start_time_in_compilation + duration) / self.total_video_duration) * width)
+            end_x = int(
+                (
+                    (track.start_time_in_compilation + duration)
+                    / self.total_video_duration
+                )
+                * width
+            )
             end_x = min(end_x, width)
-            
+
             # Draw track block
             track_width = max(2, end_x - start_x)
             track_rect = QRect(start_x, y, track_width, int(track_height - 2))
-            
+
             # Color based on volume
             color_intensity = int(155 + track.volume * 100)
             track_color = QColor(100, color_intensity, 200, 180)
-            
+
             painter.fillRect(track_rect, track_color)
-            
+
             # Draw border
             painter.setPen(QPen(QColor(200, 200, 200)))
             painter.drawRect(track_rect)
-            
+
             # Draw track name if there's room
             if track_width > 60:
                 track_name = os.path.basename(track.file_path)
-                name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_width - 10)
+                name = painter.fontMetrics().elidedText(
+                    track_name, Qt.ElideMiddle, track_width - 10
+                )
                 # Fix: Convert float to int for y coordinate
                 text_y = int(track_rect.y() + track_height / 2 + 5)
                 painter.drawText(track_rect.x() + 5, text_y, name)
@@ -3094,7 +3255,7 @@ class MusicEditorDialog(QDialog):
                 track.duration or (track.total_duration - track.start_time_in_track)
             )
             self.table.item(row, 5).setText(f"{end_time:.2f} sec")
-            
+
             # Update timeline
             self.timeline_widget.update()
 
@@ -3128,7 +3289,7 @@ class MusicEditorDialog(QDialog):
 
         # Refresh the table
         self.populate_table()
-        
+
         # Update timeline
         self.timeline_widget.update()
 
@@ -3138,7 +3299,7 @@ class MusicEditorDialog(QDialog):
             del self.music_tracks[row]
             self.changes_made = True
             self.populate_table()
-            
+
             # Update timeline
             self.timeline_widget.update()
 
@@ -3146,23 +3307,27 @@ class MusicEditorDialog(QDialog):
         """Apply changes and return"""
         if self.changes_made:
             # Mark that there are pending changes that need to be re-rendered
-            result = QMessageBox.information(
-                self,
-                "Music Changes",
-                "Music changes will be applied when you preview or export the video.",
-                QMessageBox.Ok
-            ),
+            result = (
+                QMessageBox.information(
+                    self,
+                    "Music Changes",
+                    "Music changes will be applied when you preview or export the video.",
+                    QMessageBox.Ok,
+                ),
+            )
         super().accept()
 
     def reject(self):
         """Cancel and discard changes"""
         if self.changes_made:
-            result = QMessageBox.question(
-                self,
-                "Discard Changes",
-                "You have made changes to the music tracks. Discard these changes?",
-                QMessageBox.Yes | QMessageBox.No
-            ),
+            result = (
+                QMessageBox.question(
+                    self,
+                    "Discard Changes",
+                    "You have made changes to the music tracks. Discard these changes?",
+                    QMessageBox.Yes | QMessageBox.No,
+                ),
+            )
             if result == QMessageBox.Yes:
                 # Restore original tracks
                 self.music_tracks.clear()
@@ -3179,6 +3344,9 @@ class VideoCompilationEditor(QMainWindow):
 
         # Clean up any old temp files
         cleanup_temp_dirs()
+
+        # Set window icon (assuming historian_icon.png exists in your project directory)
+        self.setWindowIcon(QIcon("historian_icon.png"))
 
         # Setup media player for previews
         self.media_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
@@ -3221,88 +3389,96 @@ class VideoCompilationEditor(QMainWindow):
         self.setGeometry(100, 100, 1200, 720)
         self.setMinimumSize(900, 600)
 
-        # Apply professional styling
+        self.setWindowTitle("Historian Video Editor")
+
+        # Apply Historian branding styling
         self.setStyleSheet(
             """
             QMainWindow, QDialog {
-                background-color: #f5f5f5;
+                background-color: #F5E8C7;  /* Parchment beige background */
             }
             QLabel {
-                color: #333333;
+                color: #5C4033;  /* Deep brown text */
+                font-family: 'Georgia', serif;  /* Rustic, classic font */
             }
             QPushButton {
-                background-color: #2c3e50;
-                color: white;
-                border: none;
+                background-color: #5C4033;  /* Deep brown buttons */
+                color: #F5E8C7;  /* Beige text */
+                border: 1px solid #3A2E22;  /* Darker brown border */
                 padding: 8px 16px;
                 border-radius: 4px;
+                font-family: 'Georgia', serif;
             }
             QPushButton:hover {
-                background-color: #34495e;
+                background-color: #7A5845;  /* Lighter brown on hover */
             }
             QPushButton:pressed {
-                background-color: #1abc9c;
+                background-color: #468C87;  /* Muted teal when pressed */
             }
             QPushButton:disabled {
-                background-color: #bdc3c7;
+                background-color: #A89F91;  /* Muted gray-brown */
+                color: #D9CDB8;
             }
             QListWidget {
-                background-color: white;
-                border: 1px solid #dcdcdc;
+                background-color: #FFF8E8;  /* Light parchment */
+                border: 1px solid #A89F91;  /* Soft gray-brown border */
                 border-radius: 4px;
                 padding: 5px;
             }
             QListWidget::item {
                 padding: 8px;
-                border-bottom: 1px solid #eeeeee;
+                border-bottom: 1px solid #E8DCC8;  /* Subtle line */
+                color: #5C4033;
             }
             QListWidget::item:selected {
-                background-color: #3498db;
-                color: white;
+                background-color: #468C87;  /* Muted teal selection */
+                color: #F5E8C7;
             }
             QToolButton {
-                background-color: #2c3e50;
-                color: white;
+                background-color: #5C4033;
+                color: #F5E8C7;
                 border: none;
                 border-radius: 4px;
             }
             QToolButton:hover {
-                background-color: #34495e;
+                background-color: #7A5845;
             }
             QFrame#statusFrame {
-                background-color: #ecf0f1;
+                background-color: #E8DCC8;  /* Slightly darker parchment */
+                border: 1px solid #A89F91;
                 border-radius: 4px;
                 padding: 5px;
             }
             QSlider::groove:horizontal {
                 height: 6px;
-                background: #dcdcdc;
+                background: #A89F91;  /* Gray-brown groove */
                 border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #2c3e50;
-                border: none;
+                background: #5C4033;  /* Brown handle */
+                border: 1px solid #3A2E22;
                 width: 14px;
                 height: 14px;
                 margin: -4px 0;
                 border-radius: 7px;
             }
             QSlider::sub-page:horizontal {
-                background: #3498db;
+                background: #468C87;  /* Teal progress */
                 border-radius: 3px;
             }
             QProgressDialog {
-                background-color: #ffffff;
-                border: 1px solid #dddddd;
+                background-color: #FFF8E8;
+                border: 1px solid #A89F91;
             }
             QProgressDialog QLabel {
                 font-size: 14px;
                 padding: 8px;
+                color: #5C4033;
             }
             QProgressDialog QPushButton {
-                background-color: #e74c3c;
+                background-color: #7A5845;  /* Cancel button */
             }
-        """
+            """
         )
 
         # Central widget
@@ -3430,7 +3606,8 @@ class VideoCompilationEditor(QMainWindow):
         # Position slider
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setRange(0, 0)
-        self.position_slider.sliderMoved.connect(self.set_position)
+        # Remove sliderMoved connection to prevent continuous updates
+        # self.position_slider.sliderMoved.connect(self.set_position)  # Removed
         self.position_slider.sliderPressed.connect(self.slider_pressed)
         self.position_slider.sliderReleased.connect(self.slider_released)
 
@@ -3446,37 +3623,36 @@ class VideoCompilationEditor(QMainWindow):
         playback_layout.addWidget(self.time_label)
 
         right_layout.addLayout(playback_layout)
-
         # Add timeline widget for visualization
         timeline_header = QHBoxLayout()
         timeline_label = QLabel("Timeline:")
         timeline_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        
+
         timeline_help = QLabel("(Drag to scroll, Ctrl+Wheel to zoom)")
         timeline_help.setStyleSheet("font-size: 10px; color: #888;")
-        
+
         zoom_out_btn = QPushButton("-")
         zoom_out_btn.setFixedWidth(30)
         zoom_out_btn.setToolTip("Zoom Out")
         zoom_out_btn.clicked.connect(self.zoom_out_timeline)
-        
+
         zoom_fit_btn = QPushButton("Fit")
         zoom_fit_btn.setFixedWidth(40)
         zoom_fit_btn.setToolTip("Fit to View")
         zoom_fit_btn.clicked.connect(self.zoom_fit_timeline)
-        
+
         zoom_in_btn = QPushButton("+")
         zoom_in_btn.setFixedWidth(30)
         zoom_in_btn.setToolTip("Zoom In")
         zoom_in_btn.clicked.connect(self.zoom_in_timeline)
-        
+
         timeline_header.addWidget(timeline_label)
         timeline_header.addWidget(timeline_help)
         timeline_header.addStretch()
         timeline_header.addWidget(zoom_out_btn)
         timeline_header.addWidget(zoom_fit_btn)
         timeline_header.addWidget(zoom_in_btn)
-        
+
         right_layout.addLayout(timeline_header)
 
         self.timeline = TimelineWidget()
@@ -3495,13 +3671,15 @@ class VideoCompilationEditor(QMainWindow):
         status_layout = QHBoxLayout(status_frame)
         status_layout.setContentsMargins(10, 5, 10, 5)
 
-        self.status_label = QLabel("Ready")
+        self.status_label = QLabel("Historian: Ready")  # Updated with branding
         self.status_label.setStyleSheet("font-weight: bold;")
         status_layout.addWidget(self.status_label)
-        
+
         # Changes indicator
         self.changes_indicator = QLabel("")
-        self.changes_indicator.setStyleSheet("color: #e74c3c;")
+        self.changes_indicator.setStyleSheet(
+            "color: #7A5845;"
+        )  # Match brown hover color
         status_layout.addWidget(self.changes_indicator, 0, Qt.AlignRight)
 
         main_layout.addWidget(status_frame)
@@ -3566,29 +3744,29 @@ class VideoCompilationEditor(QMainWindow):
 
             # Update timeline position
             self.timeline.set_position(position_sec)
-            self.timeline.update()
 
     def duration_changed(self, duration):
         """Update slider range when media duration changes"""
         self.position_slider.setRange(0, duration)
-        
+
         # Set the time label with correct total time
         if duration > 0:
             duration_sec = duration / 1000.0
-            self.time_label.setText(f"0:00 / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}")
-
-    def set_position(self, position):
-        """Set media position from slider"""
-        self.media_player.setPosition(position)
+            self.time_label.setText(
+                f"0:00 / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
+            )
 
     def slider_pressed(self):
         """Handle slider press event"""
         self.position_slider_being_dragged = True
+        # Optionally pause playback to prevent glitches during dragging
+        if self.media_player.state() == QMediaPlayer.PlayingState:
+            self.media_player.pause()
 
     def slider_released(self):
         """Handle slider release event"""
         self.position_slider_being_dragged = False
-        self.media_player.setPosition(self.position_slider.value())
+        self.set_position(self.position_slider.value())  # Only set position on release
 
     def handle_player_error(self, error):
         """Handle media player errors"""
@@ -3610,7 +3788,7 @@ class VideoCompilationEditor(QMainWindow):
     def check_pending_changes(self):
         """Check for pending changes and update UI indicators"""
         has_pending_changes = False
-        
+
         # Check all media items
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
@@ -3618,11 +3796,11 @@ class VideoCompilationEditor(QMainWindow):
             if media_item.has_pending_changes:
                 has_pending_changes = True
                 break
-        
+
         # Check if music has changed since last preview/export
         if self.has_pending_music_changes:
             has_pending_changes = True
-        
+
         # Update UI indicators
         if has_pending_changes:
             self.changes_indicator.setText("⚠️ Pending changes - preview to see updates")
@@ -3630,12 +3808,11 @@ class VideoCompilationEditor(QMainWindow):
         else:
             self.changes_indicator.setText("")
             self.timeline.set_pending_changes(False)
-            
+
             return has_pending_changes
 
     def processing_finished(self, task, result):
         """Handle processing thread completion"""
-
 
         self.is_processing = False
 
@@ -3667,7 +3844,7 @@ class VideoCompilationEditor(QMainWindow):
                 )
                 self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result)))
                 self.media_player.play()
-                
+
                 # Clear pending changes flag for this item
                 self.current_item.has_pending_changes = False
                 self.check_pending_changes()
@@ -3688,16 +3865,16 @@ class VideoCompilationEditor(QMainWindow):
                     QMediaContent(QUrl.fromLocalFile(output_file))
                 )
                 self.media_player.play()
-                
+
                 # Clear all pending changes flags
                 for i in range(self.clip_list.count()):
                     item = self.clip_list.item(i)
                     media_item = item.data(Qt.UserRole)
                     media_item.has_pending_changes = False
-                
+
                 # Clear music changes flag too
                 self.has_pending_music_changes = False
-                
+
                 # Update change indicators
                 self.check_pending_changes()
             else:
@@ -3712,25 +3889,39 @@ class VideoCompilationEditor(QMainWindow):
                     "Export Complete",
                     f"The compilation has been saved to:\n{result}",
                 )
-                
+
                 # Clear all pending changes flags
                 for i in range(self.clip_list.count()):
                     item = self.clip_list.item(i)
                     media_item = item.data(Qt.UserRole)
                     media_item.has_pending_changes = False
-                
+
                 # Clear music changes flag too
                 self.has_pending_music_changes = False
-                
+
                 # Update change indicators
                 self.check_pending_changes()
             else:
                 self.status_label.setText("Export failed - invalid output file")
 
+    def set_position(self, position):
+        """Set media position from slider, ensuring safe seeking"""
+        if self.media_player.isSeekable():  # Check if the media supports seeking
+            was_playing = self.media_player.state() == QMediaPlayer.PlayingState
+            if was_playing:
+                self.media_player.pause()  # Pause to stabilize seeking
+            self.media_player.setPosition(position)
+            if was_playing:
+                QTimer.singleShot(
+                    100, self.media_player.play
+                )  # Resume after a short delay
+        else:
+            print("Media is not seekable")
+
     def processing_error(self, task, error_msg):
         """Handle processing thread error"""
         self.is_processing = False
-        
+
         # Clear progress dialog safely
         if self.progress_dialog:
             try:
@@ -3738,7 +3929,7 @@ class VideoCompilationEditor(QMainWindow):
             except:
                 pass
             self.progress_dialog = None
-            
+
         self.status_label.setText(f"Error during {task}: {error_msg}")
         QMessageBox.warning(self, "Error", f"An error occurred: {error_msg}")
 
@@ -3841,7 +4032,7 @@ class VideoCompilationEditor(QMainWindow):
 
             # Update timeline
             self.update_timeline()
-            
+
             # Invalidate preview cache
             self.preview_all_cache["signature"] = None
 
@@ -3922,7 +4113,7 @@ class VideoCompilationEditor(QMainWindow):
 
             # Update timeline
             self.update_timeline()
-            
+
             # Invalidate preview cache
             self.preview_all_cache["signature"] = None
 
@@ -3945,10 +4136,10 @@ class VideoCompilationEditor(QMainWindow):
 
             # Update timeline since clip duration may have changed
             self.update_timeline()
-            
+
             # Check for pending changes
             self.check_pending_changes()
-            
+
             # Invalidate preview cache
             self.preview_all_cache["signature"] = None
 
@@ -3978,7 +4169,7 @@ class VideoCompilationEditor(QMainWindow):
 
         # Update timeline
         self.update_timeline()
-        
+
         # Invalidate preview cache
         self.preview_all_cache["signature"] = None
 
@@ -4010,10 +4201,10 @@ class VideoCompilationEditor(QMainWindow):
 
                 # Update timeline
                 self.update_timeline()
-                
+
                 # Invalidate preview cache
                 self.preview_all_cache["signature"] = None
-                
+
                 return
 
     def selection_changed(self):
@@ -4040,7 +4231,7 @@ class VideoCompilationEditor(QMainWindow):
         else:
             self.current_item = None
             self.status_label.setText("Ready")
-            
+
             # Clear timeline highlight
             if self.timeline:
                 self.timeline.hover_clip_index = -1
@@ -4124,9 +4315,9 @@ class VideoCompilationEditor(QMainWindow):
             item = self.clip_list.item(i)
             media_item = item.data(Qt.UserRole)
             items.append(media_item)
-            
+
         need_new_preview = self.check_pending_changes()
-            
+
         if not need_new_preview and self.preview_all_cache["path"]:
             if os.path.exists(self.preview_all_cache["path"]):
                 # Use cached preview
@@ -4163,7 +4354,7 @@ class VideoCompilationEditor(QMainWindow):
             self.processing_thread.worker.music_volume = self.music_tracks[0].volume
         else:
             self.processing_thread.worker.music_file = None
-            
+
         self.processing_thread.setup_task("preview_all", [items])
 
         # Start thread
@@ -4225,7 +4416,7 @@ class VideoCompilationEditor(QMainWindow):
             self.processing_thread.worker.music_volume = self.music_tracks[0].volume
         else:
             self.processing_thread.worker.music_file = None
-            
+
         self.processing_thread.setup_task("export", [items, output_path])
 
         # Start thread
@@ -4264,18 +4455,21 @@ class VideoCompilationEditor(QMainWindow):
             self.music_tracks = dialog.music_tracks
 
             # Check if tracks changed
-            tracks_changed = (len(old_tracks) != len(self.music_tracks))
+            tracks_changed = len(old_tracks) != len(self.music_tracks)
             if not tracks_changed:
                 for i, track in enumerate(self.music_tracks):
                     if i >= len(old_tracks):
                         tracks_changed = True
                         break
                     old_track = old_tracks[i]
-                    if (track.file_path != old_track.file_path or
-                        track.start_time_in_compilation != old_track.start_time_in_compilation or
-                        track.start_time_in_track != old_track.start_time_in_track or
-                        track.duration != old_track.duration or
-                        track.volume != old_track.volume):
+                    if (
+                        track.file_path != old_track.file_path
+                        or track.start_time_in_compilation
+                        != old_track.start_time_in_compilation
+                        or track.start_time_in_track != old_track.start_time_in_track
+                        or track.duration != old_track.duration
+                        or track.volume != old_track.volume
+                    ):
                         tracks_changed = True
                         break
 
