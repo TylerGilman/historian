@@ -1,2 +1,2 @@
 PyQt5==5.15.11
-moviepy==2.1.2
+ffmpeg-python==0.2.0
