@@ -146,7 +146,7 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 0  # Default manual rotation (89 degrees)
+        self.manual_rotation = 90 # Default manual rotation (89 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
@@ -192,24 +192,26 @@ class MediaItem:
         self.has_pending_changes = True
 
     def get_effects_filter_string(self):
-        """Get the combined filter string for all effects"""
-        filters = []
+        """Get the combined filter strings for all effects as (video_filters, audio_filters)."""
+        video_filters = []
+        audio_filters = []
         for effect in self.effects:
-            effect_filter = effect.get_ffmpeg_filter()
-            if effect_filter:
-                filters.append(effect_filter)
-
-        # Add speed adjustment if not 1.0
-        if self.playback_speed != 1.0 and not any(
-            e.effect_type == "speed" for e in self.effects
-        ):
-            # Create a speed effect
+            v_filter, a_filter = effect.get_ffmpeg_filter()
+            if v_filter:
+                video_filters.append(v_filter)
+            if a_filter:
+                audio_filters.append(a_filter)
+        # Add speed adjustment if not already in effects
+        if self.playback_speed != 1.0 and not any(e.effect_type == "speed" for e in self.effects):
             speed_effect = VideoEffect("speed", {"factor": self.playback_speed})
-            filters.append(speed_effect.get_ffmpeg_filter())
-
-        if filters:
-            return ",".join(filters)
-        return ""
+            v_filter, a_filter = speed_effect.get_ffmpeg_filter()
+            if v_filter:
+                video_filters.append(v_filter)
+            if a_filter:
+                audio_filters.append(a_filter)
+        video_str = ",".join(video_filters) if video_filters else ""
+        audio_str = ",".join(audio_filters) if audio_filters else ""
+        return (video_str, audio_str)
 
 
 class VideoClip(MediaItem):
@@ -222,24 +224,20 @@ class VideoClip(MediaItem):
         self.pixel_format = "yuv420p"
 
         try:
-            # Use subprocess for stability with ffprobe
+            # Use ffprobe to get video metadata
             cmd = [
                 "ffprobe",
-                "-v",
-                "error",
-                "-print_format",
-                "json",
+                "-v", "error",
+                "-print_format", "json",
                 "-show_format",
                 "-show_streams",
                 file_path,
             ]
-
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise ValueError(f"ffprobe failed: {result.stderr}")
 
             probe = json.loads(result.stdout)
-
             self.duration = float(probe["format"]["duration"])
             self.end_time = self.duration
 
@@ -252,26 +250,21 @@ class VideoClip(MediaItem):
                     self.pixel_format = stream.get("pix_fmt", "yuv420p")
 
                     # Handle rotation metadata
+                    self.rotation = 0  # Default rotation
                     if "tags" in stream and "rotate" in stream["tags"]:
                         self.rotation = int(stream["tags"]["rotate"])
 
-                    # Check for side data rotation
+                    # Check side data for rotation
                     if "side_data_list" in stream:
                         for side_data in stream["side_data_list"]:
                             if side_data.get("side_data_type") == "Display Matrix":
-                                # Parse rotation from display matrix
                                 rotation_data = side_data.get("rotation", "")
                                 if rotation_data:
                                     try:
-                                        # Handle both string and numeric rotation values
                                         if isinstance(rotation_data, (int, float)):
                                             rotation_val = float(rotation_data)
                                         else:
-                                            # Assume it's a string like "-90.00 degrees"
-                                            rotation_val = float(
-                                                rotation_data.split()[0]
-                                            )
-
+                                            rotation_val = float(rotation_data.split()[0])
                                         if rotation_val < 0:
                                             rotation_val = 360 + rotation_val
                                         self.rotation = int(rotation_val)
@@ -279,8 +272,54 @@ class VideoClip(MediaItem):
                                         pass
                     break
 
+            # Automatically adjust to portrait, right side up
+            self.adjust_to_portrait()
+
         except Exception as e:
             raise ValueError(f"Failed to probe {file_path}: {str(e)}")
+
+    def adjust_to_portrait(self):
+        """Automatically adjust rotation to make the video portrait and right side up."""
+        # Normalize current rotation to 0-360
+        current_rotation = self.rotation % 360
+
+        # Determine natural orientation based on dimensions
+        is_naturally_portrait = self.width < self.height
+
+        # Target: portrait (width < height) and upright (top edge up)
+        # After rotation, width and height may swap
+        if is_naturally_portrait:
+            # Naturally portrait (e.g., 720x1280)
+            if current_rotation == 0:
+                # Upright, already good
+                self.manual_rotation = 0
+            elif current_rotation == 90:
+                # Sideways (right edge up), rotate -90° to upright
+                self.manual_rotation = -90  # Becomes 270° when added
+            elif current_rotation == 180:
+                # Upside-down, rotate 180° to upright
+                self.manual_rotation = 180
+            elif current_rotation == 270:
+                # Sideways (left edge up), rotate 90° to upright
+                self.manual_rotation = 90
+        else:
+            # Naturally landscape (e.g., 1280x720)
+            if current_rotation == 0:
+                # Landscape upright, rotate 90° to portrait upright
+                self.manual_rotation = 90
+            elif current_rotation == 90:
+                # Portrait sideways (right edge up), rotate -90° to upright
+                self.manual_rotation = -90  # Becomes 270° when added
+            elif current_rotation == 180:
+                # Landscape upside-down, rotate -90° to portrait upright
+                self.manual_rotation = -90  # Becomes 270° when added
+            elif current_rotation == 270:
+                # Portrait sideways (left edge up), rotate 90° to upright
+                self.manual_rotation = 90
+
+        # Normalize manual_rotation to 0-360
+        self.manual_rotation = (self.manual_rotation + 360) % 360
+        print(f"Adjusted {os.path.basename(self.file_path)}: original rotation={current_rotation}, manual_rotation={self.manual_rotation}")
 
 
 class ImageItem(MediaItem):
@@ -600,180 +639,127 @@ class ProcessingWorker(QObject):
         self._abort = True
 
     def create_preview(self, media_item):
-        """Create a preview for a single item"""
+        """Create a preview for a single item with robust error handling and speed adjustment."""
         try:
-            # Check if we should abort
             if self._abort:
                 return "Aborted"
 
-            # Get or create preview filename
             preview_file = media_item.get_preview_filename()
-
-            # If preview already exists, return it
             if media_item.preview_file and os.path.exists(media_item.preview_file):
-                if os.path.getsize(media_item.preview_file) > 1000:  # Size sanity check
+                if os.path.getsize(media_item.preview_file) > 1000:
                     media_item.preview_status = "ready"
                     media_item.has_pending_changes = False
                     return media_item.preview_file
                 else:
-                    # Invalid preview, recreate it
                     try:
                         os.unlink(media_item.preview_file)
-                    except:
-                        pass
+                    except Exception as e:
+                        print(f"Warning: Failed to delete invalid preview file: {e}")
                     media_item.preview_file = None
                     media_item.preview_status = "none"
 
-            # Create preview directory if needed
             os.makedirs(os.path.dirname(preview_file), exist_ok=True)
+            self.progress.emit(10, f"Processing {os.path.basename(media_item.file_path)}...")
 
-            self.progress.emit(
-                10, f"Processing {os.path.basename(media_item.file_path)}..."
-            )
+            # Get separate video and audio filters
+            video_effects, audio_effects = media_item.get_effects_filter_string()
 
-            # Get effects filters if any
-            effects_filter = media_item.get_effects_filter_string()
-
+            cmd = ["ffmpeg", "-y", "-v", "error"]
             if media_item.is_image:
-                # Build filter string for image
                 vf = "scale=480:-2"
-
-                # Add rotation if needed
                 if media_item.manual_rotation != 0:
                     rotation = f"rotate={media_item.manual_rotation*math.pi/180}"
                     vf = f"{rotation},{vf}"
-
-                # Add effects if any
-                if effects_filter:
-                    vf = f"{effects_filter},{vf}"
-
-                # Process image preview - low resolution for speed
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-loop",
-                    "1",
-                    "-i",
-                    media_item.file_path,
-                    "-t",
-                    str(media_item.display_duration),
-                    "-vf",
-                    vf,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "30",
-                    "-pix_fmt",
-                    "yuv420p",
-                    preview_file,
-                ]
+                if video_effects:
+                    vf = f"{video_effects},{vf}"
+                duration = max(0.1, media_item.display_duration)
+                cmd.extend([
+                    "-loop", "1", "-i", media_item.file_path,
+                    "-t", str(duration),
+                    "-vf", vf,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+                    "-pix_fmt", "yuv420p", preview_file
+                ])
             else:
-                # Build filter string for video
+                has_audio = False
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_streams", "-select_streams", "a", media_item.file_path],
+                        capture_output=True, text=True
+                    )
+                    has_audio = "codec_name" in probe.stdout
+                except Exception as e:
+                    print(f"Warning: Failed to probe audio for {media_item.file_path}: {e}")
+
                 vf = "scale=480:-2,fps=24"
-
-                # Add rotation if needed
-                total_rotation = (
-                    media_item.rotation + media_item.manual_rotation
-                ) % 360
+                total_rotation = (media_item.rotation + media_item.manual_rotation) % 360
                 if total_rotation != 0:
+                    rotation_filter = ""
                     if total_rotation == 90:
-                        rotation_filter = "transpose=1"
+                        rotation_filter = "transpose=1,"
                     elif total_rotation == 180:
-                        rotation_filter = "transpose=2,transpose=2"
+                        rotation_filter = "transpose=2,transpose=2,"
                     elif total_rotation == 270:
-                        rotation_filter = "transpose=2"
-                    vf = f"{rotation_filter},{vf}"
+                        rotation_filter = "transpose=2,"
+                    vf = f"{rotation_filter}{vf}"
+                if video_effects:
+                    vf = f"{video_effects},{vf}"
 
-                # Add effects if any
-                if effects_filter:
-                    vf = f"{effects_filter},{vf}"
+                duration = (media_item.end_time or media_item.duration) - media_item.start_time
+                if duration <= 0:
+                    print(f"Warning: Invalid duration {duration} for {media_item.file_path}, setting to 0.1")
+                    duration = 0.1
+                    media_item.end_time = media_item.start_time + duration
 
-                # Process video preview - optimize for speed
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    media_item.file_path,
-                    "-ss",
-                    str(media_item.start_time),
-                    "-t",
-                    str(
-                        (media_item.end_time or media_item.duration)
-                        - media_item.start_time
-                    ),
-                    "-vf",
-                    vf,
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "ultrafast",
-                    "-crf",
-                    "30",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "64k",
-                    "-pix_fmt",
-                    "yuv420p",
-                    preview_file,
-                ]
+                cmd.extend([
+                    "-i", media_item.file_path,
+                    "-ss", str(media_item.start_time),
+                    "-t", str(duration),
+                    "-vf", vf,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"
+                ])
+                if has_audio:
+                    if audio_effects:
+                        cmd.extend(["-af", audio_effects])
+                    cmd.extend(["-c:a", "aac", "-b:a", "64k"])
+                cmd.extend(["-pix_fmt", "yuv420p", preview_file])
 
-            # Run ffmpeg process
+            print(f"Executing ffmpeg command: {' '.join(cmd)}")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 universal_newlines=True,
-                bufsize=1,
+                bufsize=1
             )
 
-            # Process output line by line for progress tracking
             for line in iter(process.stdout.readline, ""):
                 if self._abort:
                     process.terminate()
                     media_item.preview_status = "none"
                     return "Aborted"
-
                 if "time=" in line:
-                    # Try to extract time information
                     try:
                         time_parts = line.split("time=")[1].split()[0].split(":")
                         if len(time_parts) == 3:
                             hours, minutes, seconds = time_parts
-                            current_sec = (
-                                float(hours) * 3600
-                                + float(minutes) * 60
-                                + float(seconds.replace(",", "."))
-                            )
-                            total_sec = (
-                                media_item.end_time or media_item.duration
-                            ) - media_item.start_time
-                            if media_item.is_image:
-                                total_sec = media_item.display_duration
+                            current_sec = float(hours) * 3600 + float(minutes) * 60 + float(seconds.replace(",", "."))
+                            total_sec = duration
                             if total_sec > 0:
-                                progress = min(
-                                    int((current_sec / total_sec) * 80) + 10, 90
-                                )
-                                self.progress.emit(
-                                    progress,
-                                    f"Processing {os.path.basename(media_item.file_path)}...",
-                                )
-                    except:
-                        pass
+                                progress = min(int((current_sec / total_sec) * 80) + 10, 90)
+                                self.progress.emit(progress, f"Processing {os.path.basename(media_item.file_path)}...")
+                    except Exception as e:
+                        print(f"Warning: Failed to parse ffmpeg progress: {e}")
 
-            # Wait for process to complete
-            process.wait()
-
+            stdout, stderr = process.communicate()
             if process.returncode != 0:
                 self.progress.emit(0, "Error processing file")
                 media_item.preview_status = "error"
-                return f"Error: ffmpeg process failed with code {process.returncode}"
+                error_msg = f"ffmpeg error {process.returncode}: {stderr.strip() or 'No error details available'}"
+                print(error_msg)
+                return f"Error: {error_msg}"
 
             self.progress.emit(100, "Preview ready")
-
-            # Check if output file exists and is valid
             if os.path.exists(preview_file) and os.path.getsize(preview_file) > 1000:
                 media_item.preview_file = preview_file
                 media_item.preview_status = "ready"
@@ -781,11 +767,14 @@ class ProcessingWorker(QObject):
                 return preview_file
             else:
                 media_item.preview_status = "error"
-                return "Error: Created preview file is invalid"
+                error_msg = "Error: Created preview file is invalid or empty"
+                print(error_msg)
+                return error_msg
 
         except Exception as e:
             self.progress.emit(0, f"Error: {str(e)}")
             media_item.preview_status = "error"
+            print(f"Exception in create_preview: {str(e)}")
             return f"Error: {str(e)}"
 
     def slider_released(self):
@@ -794,8 +783,7 @@ class ProcessingWorker(QObject):
         self.set_position(self.position_slider.value())  # Only set position on release
 
     def update_progress(self, value, message):
-        """Update progress dialog"""
-        if self.progress_dialog is not None:
+        if self.progress_dialog is not None and self.progress_dialog.isVisible():
             try:
                 self.progress_dialog.setValue(value)
                 self.progress_dialog.setLabelText(message)
@@ -805,14 +793,13 @@ class ProcessingWorker(QObject):
             print(f"Progress update skipped: No active dialog for '{message}'")
 
     def process_all_clips(self, items):
-        """Process all clips for preview - optimized for speed with HW acceleration"""
+        """Process all clips for preview with separate video and audio filters."""
         try:
             if not items:
                 return "No items to process"
 
             # Use libx264 for maximum compatibility
             best_encoder = "libx264"
-
             self.progress.emit(5, f"Using CPU encoding for maximum compatibility")
 
             # Process each item
@@ -838,15 +825,19 @@ class ProcessingWorker(QObject):
 
                 # Use the full duration as specified by user edits
                 if not media_item.is_image:
-                    # For video - use full edited duration
                     preview_duration = (
                         media_item.end_time or media_item.duration
                     ) - media_item.start_time
                 else:
-                    # For images - use full display duration
                     preview_duration = media_item.display_duration
 
-                # Add to total duration
+                # Validate duration
+                if preview_duration <= 0:
+                    print(f"Warning: Invalid duration {preview_duration} for {media_item.file_path}, setting to 0.1")
+                    preview_duration = 0.1
+                    if not media_item.is_image:
+                        media_item.end_time = media_item.start_time + preview_duration
+
                 total_duration += preview_duration
 
                 # Create a temporary preview for this item
@@ -854,56 +845,43 @@ class ProcessingWorker(QObject):
                     TEMP_DIR, f"temp_preview_{i}_{uuid.uuid4().hex[:8]}.mp4"
                 )
 
-                # Get effects filter
-                effects_filter = media_item.get_effects_filter_string()
+                # Get separate video and audio filters
+                video_effects, audio_effects = media_item.get_effects_filter_string()
 
                 # Base command for both image and video
-                base_cmd = ["ffmpeg", "-y", "-v", "error"]
+                cmd = ["ffmpeg", "-y", "-v", "error"]
+
+                # Check if video has audio
+                has_audio = False
+                if not media_item.is_image:
+                    try:
+                        probe = subprocess.run(
+                            ["ffprobe", "-v", "error", "-show_streams", "-select_streams", "a", media_item.file_path],
+                            capture_output=True, text=True
+                        )
+                        has_audio = "codec_name" in probe.stdout
+                    except Exception as e:
+                        print(f"Warning: Failed to probe audio for {media_item.file_path}: {e}")
 
                 # For images
                 if media_item.is_image:
-                    # Build the filter string
                     vf = "scale=480:-2,fps=24"
-
-                    # Add rotation if needed
                     if media_item.manual_rotation != 0:
                         rotation = f"rotate={media_item.manual_rotation*math.pi/180}"
                         vf = f"{rotation},{vf}"
-
-                    # Add effects if any
-                    if effects_filter:
-                        vf = f"{effects_filter},{vf}"
-
-                    # Build command
-                    cmd = base_cmd + [
-                        "-loop",
-                        "1",
-                        "-i",
-                        media_item.file_path,
-                        "-t",
-                        str(preview_duration),
-                        "-vf",
-                        vf,
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-crf",
-                        "28",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-f",
-                        "mp4",
-                        temp_preview,
-                    ]
+                    if video_effects:
+                        vf = f"{video_effects},{vf}"
+                    cmd.extend([
+                        "-loop", "1", "-i", media_item.file_path,
+                        "-t", str(preview_duration),
+                        "-vf", vf,
+                        "-c:v", best_encoder, "-preset", "ultrafast", "-crf", "28",
+                        "-pix_fmt", "yuv420p", "-f", "mp4", temp_preview
+                    ])
                 else:
-                    # For videos - build the filter string
+                    # For videos
                     vf = "scale=480:-2,fps=24"
-
-                    # Add rotation if needed
-                    total_rotation = (
-                        media_item.rotation + media_item.manual_rotation
-                    ) % 360
+                    total_rotation = (media_item.rotation + media_item.manual_rotation) % 360
                     if total_rotation != 0:
                         rotation_filter = ""
                         if total_rotation == 90:
@@ -913,449 +891,186 @@ class ProcessingWorker(QObject):
                         elif total_rotation == 270:
                             rotation_filter = "transpose=2,"
                         vf = f"{rotation_filter}{vf}"
+                    if video_effects:
+                        vf = f"{video_effects},{vf}"
 
-                    # Add effects if any
-                    if effects_filter:
-                        vf = f"{effects_filter},{vf}"
+                    cmd.extend([
+                        "-ss", str(media_item.start_time),
+                        "-i", media_item.file_path,
+                        "-t", str(preview_duration),
+                        "-vf", vf,
+                        "-c:v", best_encoder, "-preset", "ultrafast", "-crf", "28"
+                    ])
+                    if has_audio:
+                        if audio_effects:
+                            cmd.extend(["-af", audio_effects])
+                        cmd.extend(["-c:a", "aac", "-b:a", "96k"])
+                    cmd.extend(["-pix_fmt", "yuv420p", "-f", "mp4", temp_preview])
 
-                    # Build command
-                    cmd = base_cmd + [
-                        "-ss",
-                        str(media_item.start_time),
-                        "-i",
-                        media_item.file_path,
-                        "-t",
-                        str(preview_duration),
-                        "-vf",
-                        vf,
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "ultrafast",
-                        "-crf",
-                        "28",
-                        "-c:a",
-                        "aac",  # Include audio for a proper preview
-                        "-b:a",
-                        "96k",  # Lower audio bitrate for faster processing
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-f",
-                        "mp4",
-                        temp_preview,
-                    ]
+                # Log and run the command
+                print(f"Executing ffmpeg command: {' '.join(cmd)}")
+                process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
 
-                # Run command with process monitoring to allow cancellation
-                try:
-                    self.progress.emit(
-                        int((i / total_items) * 60) + 10,
-                        f"Processing {os.path.basename(media_item.file_path)}...",
-                    )
-
-                    process = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                    )
-
-                    # Monitor the process with timeout
-                    start_time = time.time()
-                    max_processing_time = max(
-                        60, preview_duration * 2
-                    )  # Allow more time for longer clips
-
-                    while process.poll() is None:
-                        # Check for abort
-                        if self._abort:
-                            process.terminate()
+                start_time = time.time()
+                max_processing_time = max(60, preview_duration * 2)
+                while process.poll() is None:
+                    if self._abort:
+                        process.terminate()
+                        try:
+                            if os.path.exists(temp_preview):
+                                os.unlink(temp_preview)
+                        except:
+                            pass
+                        for file in valid_files:
                             try:
-                                if os.path.exists(temp_preview):
-                                    os.unlink(temp_preview)
+                                if os.path.exists(file):
+                                    os.unlink(file)
                             except:
                                 pass
-                            # Clean up existing files
+                        return "Aborted"
+                    if time.time() - start_time > max_processing_time:
+                        process.terminate()
+                        print(f"Processing timeout for {media_item.file_path} after {max_processing_time} seconds")
+                        break
+                    time.sleep(0.1)
+
+                stdout, stderr = process.communicate()
+                if process.returncode != 0:
+                    error_msg = f"Error creating preview for {media_item.file_path}: {stderr.strip() or 'No error details'}"
+                    print(error_msg)
+                    continue  # Skip this file on error
+
+                if os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 1000:
+                    valid_files.append(temp_preview)
+                    media_item.has_pending_changes = False
+                else:
+                    print(f"Error: Temp preview file {temp_preview} is invalid or empty")
+                    continue
+
+            if not valid_files:
+                return "Failed to create any valid previews"
+
+            # Handle case with only one valid file
+            if len(valid_files) == 1:
+                output_file = os.path.join(TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4")
+                if self.music_tracks or (self.music_file and os.path.exists(self.music_file)):
+                    self.progress.emit(80, "Adding background music...")
+
+                    if self.music_tracks:
+                        temp_music_file = os.path.join(TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3")
+                        if len(self.music_tracks) > 1:
+                            music_cmd = ["ffmpeg", "-y", "-v", "error"]
+                            music_filter = ""
+                            valid_track_count = 0
+                            for track in self.music_tracks:
+                                if os.path.exists(track.file_path):
+                                    music_cmd.extend(["-i", track.file_path])
+                                    valid_track_count += 1
+                            if valid_track_count == 0:
+                                shutil.copy(valid_files[0], output_file)
+                                return (output_file, total_duration)
+
+                            for i in range(valid_track_count):
+                                music_filter += f"[{i}:a]volume={self.music_tracks[i].volume},"
+                                if (self.music_tracks[i].start_time_in_track > 0 or self.music_tracks[i].duration):
+                                    music_filter += f"atrim=start={self.music_tracks[i].start_time_in_track}"
+                                    if self.music_tracks[i].duration:
+                                        music_filter += f":duration={self.music_tracks[i].duration}"
+                                    music_filter += ","
+                                music_filter += f"aformat=sample_fmts=fltp[a{i}];"
+                            music_filter += "".join(f"[a{i}]" for i in range(valid_track_count)) + f"amix=inputs={valid_track_count}:duration=longest[aout]"
+
+                            music_cmd.extend([
+                                "-filter_complex", music_filter,
+                                "-map", "[aout]",
+                                "-c:a", "mp3", "-b:a", "192k",
+                                temp_music_file
+                            ])
+                            music_process = subprocess.Popen(music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                            music_process.wait(timeout=60)
+                            if not os.path.exists(temp_music_file) or os.path.getsize(temp_music_file) < 1000:
+                                print("Failed to create mixed music file")
+                                shutil.copy(valid_files[0], output_file)
+                                return (output_file, total_duration)
+                        else:
+                            temp_music_file = self.music_tracks[0].file_path if os.path.exists(self.music_tracks[0].file_path) else None
+                            if not temp_music_file:
+                                shutil.copy(valid_files[0], output_file)
+                                return (output_file, total_duration)
+
+                        final_output = os.path.join(TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4")
+                        music_add_cmd = [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", valid_files[0], "-i", temp_music_file,
+                            "-filter_complex", "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map", "0:v", "-map", "[a]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            "-shortest", final_output
+                        ]
+                        add_process = subprocess.Popen(music_add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        add_process.wait(timeout=60)
+                        if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                            output_file = final_output
                             for file in valid_files:
                                 try:
                                     if os.path.exists(file):
                                         os.unlink(file)
                                 except:
                                     pass
-                            return "Aborted"
-
-                        # Check for timeout
-                        if time.time() - start_time > max_processing_time:
-                            process.terminate()
-                            print(
-                                f"Processing timeout for {media_item.file_path} after {max_processing_time} seconds"
-                            )
-                            break
-
-                        # Wait a bit before checking again
-                        time.sleep(0.1)
-
-                    # Get any error output
-                    _, stderr = process.communicate(timeout=1)
-
-                    # Check if file was created successfully
-                    if (
-                        os.path.exists(temp_preview)
-                        and os.path.getsize(temp_preview) > 1000
-                    ):
-                        valid_files.append(temp_preview)
-                        # Mark the item as having no pending changes
-                        media_item.has_pending_changes = False
-                    else:
-                        print(
-                            f"Error creating preview for {media_item.file_path}: {stderr}"
-                        )
-                except Exception as e:
-                    print(f"Error processing file {media_item.file_path}: {str(e)}")
-                    # Skip this file on any error
-                    pass
-
-            if not valid_files:
-                return "Failed to create any valid previews"
-
-            # Handle case with only one valid file - just return it directly
-            if len(valid_files) == 1:
-                output_file = os.path.join(
-                    TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4"
-                )
-
-                # Check if music should be added to single file
-                if self.music_tracks or (
-                    self.music_file and os.path.exists(self.music_file)
-                ):
-                    self.progress.emit(80, "Adding background music...")
-
-                    # Use music tracks if available, otherwise use single music file
-                    if self.music_tracks:
-                        try:
-                            # Copy the file first - safer approach
-                            shutil.copy(valid_files[0], output_file)
-
-                            # For a single video, use a simpler approach to add music
-                            # This reduces the chance of a segfault
-                            temp_music_file = os.path.join(
-                                TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
-                            )
-
-                            # First, create a combined music file if multiple tracks
                             if len(self.music_tracks) > 1:
-                                # Build command to mix music tracks
-                                music_cmd = ["ffmpeg", "-y", "-v", "error"]
-                                music_filter = ""
-
-                                # Add inputs
-                                valid_track_count = 0
-                                for track in self.music_tracks:
-                                    if os.path.exists(track.file_path):
-                                        music_cmd.extend(["-i", track.file_path])
-                                        valid_track_count += 1
-
-                                if valid_track_count == 0:
-                                    # No valid music tracks, just return video
-                                    return (output_file, total_duration)
-
-                                # Create filter for mixing
-                                for i in range(valid_track_count):
-                                    music_filter += (
-                                        f"[{i}:a]volume={self.music_tracks[i].volume},"
-                                    )
-
-                                    # Apply trim if needed
-                                    if (
-                                        self.music_tracks[i].start_time_in_track > 0
-                                        or self.music_tracks[i].duration
-                                    ):
-                                        music_filter += f"atrim=start={self.music_tracks[i].start_time_in_track}"
-                                        if self.music_tracks[i].duration:
-                                            music_filter += f":duration={self.music_tracks[i].duration}"
-                                        music_filter += ","
-
-                                    # End this input's processing
-                                    music_filter += f"aformat=sample_fmts=fltp[a{i}];"
-
-                                # Mix all inputs
-                                music_filter += "".join(
-                                    f"[a{i}]" for i in range(valid_track_count)
-                                )
-                                music_filter += f"amix=inputs={valid_track_count}:duration=longest[aout]"
-
-                                # Finalize command
-                                music_cmd.extend(
-                                    [
-                                        "-filter_complex",
-                                        music_filter,
-                                        "-map",
-                                        "[aout]",
-                                        "-c:a",
-                                        "mp3",
-                                        "-b:a",
-                                        "192k",
-                                        temp_music_file,
-                                    ]
-                                )
-
-                                # Run music mix command with timeout
                                 try:
-                                    music_process = subprocess.Popen(
-                                        music_cmd,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        text=True,
-                                    )
-
-                                    # Wait with timeout
-                                    start_time = time.time()
-                                    while music_process.poll() is None:
-                                        if (
-                                            time.time() - start_time > 60
-                                        ):  # 60 second timeout
-                                            music_process.terminate()
-                                            print("Music mixing timed out")
-                                            break
-                                        time.sleep(0.1)
-
-                                    # Check result
-                                    if (
-                                        not os.path.exists(temp_music_file)
-                                        or os.path.getsize(temp_music_file) < 1000
-                                    ):
-                                        print("Failed to create mixed music file")
-                                        # Return video without music
-                                        return (output_file, total_duration)
-                                except Exception as e:
-                                    print(f"Error mixing music tracks: {str(e)}")
-                                    # Return video without music
-                                    return (output_file, total_duration)
-                            else:
-                                # Just one track, use it directly
-                                if os.path.exists(self.music_tracks[0].file_path):
-                                    temp_music_file = self.music_tracks[0].file_path
-                                else:
-                                    # No valid music track
-                                    return (output_file, total_duration)
-
-                            # Now add the music to the video
-                            music_add_cmd = [
-                                "ffmpeg",
-                                "-y",
-                                "-v",
-                                "error",
-                                "-i",
-                                output_file,
-                                "-i",
-                                temp_music_file,
-                                "-filter_complex",
-                                "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                                "-map",
-                                "0:v",
-                                "-map",
-                                "[a]",
-                                "-c:v",
-                                "copy",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "128k",
-                                "-shortest",
-                            ]
-
-                            # Create final output file
-                            final_output = os.path.join(
-                                TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
-                            )
-                            music_add_cmd.append(final_output)
-
-                            # Run command with timeout
-                            try:
-                                add_process = subprocess.Popen(
-                                    music_add_cmd,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    text=True,
-                                )
-
-                                # Wait with timeout
-                                start_time = time.time()
-                                while add_process.poll() is None:
-                                    if (
-                                        time.time() - start_time > 60
-                                    ):  # 60 second timeout
-                                        add_process.terminate()
-                                        print("Music addition timed out")
-                                        break
-                                    time.sleep(0.1)
-
-                                # Check result
-                                if (
-                                    os.path.exists(final_output)
-                                    and os.path.getsize(final_output) > 1000
-                                ):
-                                    # Success - clean up and return
-                                    os.unlink(
-                                        output_file
-                                    )  # Remove the non-music version
-
-                                    # Clean up temp music file if we created it
-                                    if (
-                                        len(self.music_tracks) > 1
-                                        and temp_music_file
-                                        != self.music_tracks[0].file_path
-                                    ):
-                                        try:
-                                            os.unlink(temp_music_file)
-                                        except:
-                                            pass
-
-                                    # Clean up temp files
-                                    for file in valid_files:
-                                        try:
-                                            if os.path.exists(file):
-                                                os.unlink(file)
-                                        except:
-                                            pass
-
-                                    self.progress.emit(
-                                        100, "Preview ready (with music)"
-                                    )
-                                    return (final_output, total_duration)
-                            except Exception as e:
-                                print(f"Error adding music to video: {str(e)}")
-                        except Exception as e:
-                            print(f"Error in music processing: {str(e)}")
-                            # Fall through to use the video without music
-                    else:
-                        # Legacy: Add music to single file using the simple approach
-                        try:
-                            # Copy file first
+                                    os.unlink(temp_music_file)
+                                except:
+                                    pass
+                        else:
                             shutil.copy(valid_files[0], output_file)
+                    else:
+                        # Legacy music file handling
+                        final_output = os.path.join(TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4")
+                        music_cmd = [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", valid_files[0], "-i", self.music_file,
+                            "-filter_complex", f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map", "0:v", "-map", "[a]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            "-shortest", final_output
+                        ]
+                        process = subprocess.Popen(music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        process.wait(timeout=60)
+                        if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                            output_file = final_output
+                            for file in valid_files:
+                                try:
+                                    if os.path.exists(file):
+                                        os.unlink(file)
+                                except:
+                                    pass
+                        else:
+                            shutil.copy(valid_files[0], output_file)
+                else:
+                    shutil.copy(valid_files[0], output_file)
 
-                            # Create music command
-                            music_cmd = [
-                                "ffmpeg",
-                                "-y",
-                                "-v",
-                                "error",
-                                "-i",
-                                output_file,
-                                "-i",
-                                self.music_file,
-                                "-filter_complex",
-                                f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                                "-map",
-                                "0:v",
-                                "-map",
-                                "[a]",
-                                "-c:v",
-                                "copy",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "128k",
-                            ]
-
-                            # Create final output
-                            final_output = os.path.join(
-                                TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
-                            )
-                            music_cmd.append(final_output)
-
-                            # Run command
-                            process = subprocess.Popen(
-                                music_cmd,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                            )
-
-                            # Monitor with timeout
-                            start_time = time.time()
-                            while process.poll() is None:
-                                if self._abort:
-                                    process.terminate()
-                                    try:
-                                        if os.path.exists(final_output):
-                                            os.unlink(final_output)
-                                    except:
-                                        pass
-                                    return "Aborted"
-
-                                if time.time() - start_time > 60:
-                                    process.terminate()
-                                    break
-
-                                time.sleep(0.1)
-
-                            # Check if successful
-                            if (
-                                os.path.exists(final_output)
-                                and os.path.getsize(final_output) > 1000
-                            ):
-                                # Success - clean up and return
-                                os.unlink(output_file)  # Remove non-music version
-
-                                # Clean up temp files
-                                for file in valid_files:
-                                    try:
-                                        if os.path.exists(file):
-                                            os.unlink(file)
-                                    except:
-                                        pass
-
-                                self.progress.emit(100, "Preview ready (with music)")
-                                return (final_output, total_duration)
-                        except Exception as e:
-                            print(f"Error in legacy music processing: {str(e)}")
-                            # Fall through to use video without music
-
-                # If we get here, either music wasn't requested or it failed
-                # Just return the copy of the single clip
-                try:
-                    # Make sure we have a copy of the file
-                    if (
-                        not os.path.exists(output_file)
-                        or os.path.getsize(output_file) < 1000
-                    ):
-                        shutil.copy(valid_files[0], output_file)
-
-                    if (
-                        os.path.exists(output_file)
-                        and os.path.getsize(output_file) > 1000
-                    ):
-                        self.progress.emit(100, "Preview ready (single clip)")
-
-                        # Clean up temp files
-                        for file in valid_files:
-                            try:
-                                if os.path.exists(file) and file != output_file:
-                                    os.unlink(file)
-                            except:
-                                pass
-
-                        return (output_file, total_duration)
-                except Exception as e:
-                    print(f"Error copying single file: {str(e)}")
-                    # Try to return the original file as fallback
-                    if os.path.exists(valid_files[0]):
-                        return (valid_files[0], total_duration)
-                    return "Error: Failed to create preview output"
+                self.progress.emit(100, "Preview ready (single clip)")
+                for file in valid_files:
+                    try:
+                        if os.path.exists(file) and file != output_file:
+                            os.unlink(file)
+                    except:
+                        pass
+                return (output_file, total_duration)
 
             # Multiple clips - concatenate them
             self.progress.emit(80, "Combining all clips...")
-
-            # Output file
             output_file = os.path.join(TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4")
-
-            # Create a temporary file list for concat
             file_list = os.path.join(TEMP_DIR, f"files_{uuid.uuid4().hex}.txt")
             with open(file_list, "w") as f:
                 for file_path in valid_files:
                     fixed_path = file_path.replace("\\", "/")
                     f.write(f"file '{fixed_path}'\n")
 
-            # Check for cancellation
             if self._abort:
-                # Clean up
                 try:
                     if os.path.exists(file_list):
                         os.unlink(file_list)
@@ -1366,36 +1081,14 @@ class ProcessingWorker(QObject):
                     pass
                 return "Aborted"
 
-            # Try to use the concat demuxer first (faster)
-            cmd = [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "error",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                file_list,
-                "-c",
-                "copy",
-                output_file,
-            ]
+            cmd = ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", file_list, "-c", "copy", output_file]
+            print(f"Executing ffmpeg concat command: {' '.join(cmd)}")
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-            # Run with monitoring
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-
-            # Monitor the process
             start_time = time.time()
             while process.poll() is None:
-                # Check for abort
                 if self._abort:
                     process.terminate()
-
-                    # Clean up
                     try:
                         if os.path.exists(file_list):
                             os.unlink(file_list)
@@ -1407,240 +1100,123 @@ class ProcessingWorker(QObject):
                     except:
                         pass
                     return "Aborted"
-
-                # Check for timeout (longer for concat)
-                if time.time() - start_time > 60:  # 60 seconds timeout
+                if time.time() - start_time > 60:
                     process.terminate()
                     print("Concat operation timed out after 60 seconds")
                     break
-
-                # Wait a bit
                 time.sleep(0.1)
 
-            # Clean up file list
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                print(f"Concat error: {stderr.strip() or 'No error details'}")
+                if valid_files:
+                    output_file = valid_files[0]  # Fallback to first clip
+                else:
+                    return "Error: Failed to concatenate clips"
+
             if os.path.exists(file_list):
                 os.unlink(file_list)
 
             # Add background music if provided
             if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
-                # Check if we have music tracks or legacy music file
-                if self.music_tracks or (
-                    self.music_file and os.path.exists(self.music_file)
-                ):
+                if self.music_tracks or (self.music_file and os.path.exists(self.music_file)):
                     self.progress.emit(90, "Adding background music...")
-                    # Use a simpler approach for adding music to avoid segfault
+                    temp_music_file = os.path.join(TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3")
+                    final_output = os.path.join(TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4")
 
-                    try:
-                        # Create a combined music file if needed
-                        temp_music_file = os.path.join(
-                            TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
-                        )
-
-                        if self.music_tracks and len(self.music_tracks) > 0:
-                            # If multiple tracks, mix them first
-                            if len(self.music_tracks) > 1:
-                                # Mix all music tracks to a single file
-                                music_cmd = ["ffmpeg", "-y", "-v", "error"]
-                                music_inputs = []
-
-                                # Add all valid tracks
-                                valid_tracks = []
-                                for track in self.music_tracks:
-                                    if os.path.exists(track.file_path):
-                                        music_cmd.extend(["-i", track.file_path])
-                                        valid_tracks.append(track)
-
-                                if not valid_tracks:
-                                    # No valid music, skip music addition
-                                    self.progress.emit(
-                                        100, "Preview ready (no music available)"
-                                    )
-                                    return (output_file, total_duration)
-
-                                # Create filter string
-                                filter_str = ""
-                                for i, track in enumerate(valid_tracks):
-                                    # Base volume adjustment
-                                    filter_str += f"[{i}:a]volume={track.volume}"
-
-                                    # Add trim if needed
-                                    if track.start_time_in_track > 0 or track.duration:
-                                        filter_str += (
-                                            f",atrim=start={track.start_time_in_track}"
-                                        )
-                                        if track.duration:
-                                            filter_str += f":duration={track.duration}"
-
-                                    # Add delay for start_time_in_compilation
-                                    if track.start_time_in_compilation > 0:
-                                        filter_str += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
-
-                                    # End this input
-                                    filter_str += f"[a{i}];"
-
-                                # Mix all inputs
-                                filter_str += "".join(
-                                    f"[a{i}]" for i in range(len(valid_tracks))
-                                )
-                                filter_str += f"amix=inputs={len(valid_tracks)}:duration=longest[aout]"
-
-                                # Complete command
-                                music_cmd.extend(
-                                    [
-                                        "-filter_complex",
-                                        filter_str,
-                                        "-map",
-                                        "[aout]",
-                                        "-c:a",
-                                        "mp3",
-                                        "-b:a",
-                                        "192k",
-                                        temp_music_file,
-                                    ]
-                                )
-
-                                # Run with timeout
-                                music_process = subprocess.Popen(
-                                    music_cmd,
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE,
-                                    text=True,
-                                )
-
-                                start_time = time.time()
-                                while music_process.poll() is None:
-                                    if time.time() - start_time > 60:
-                                        music_process.terminate()
-                                        print("Music mixing timed out")
-                                        # Skip music addition
-                                        self.progress.emit(
-                                            100, "Preview ready (music mixing failed)"
-                                        )
-                                        return (output_file, total_duration)
-                                    time.sleep(0.1)
-
-                                # Check result
-                                if (
-                                    not os.path.exists(temp_music_file)
-                                    or os.path.getsize(temp_music_file) < 1000
-                                ):
-                                    # Failed to create mixed music
-                                    self.progress.emit(100, "Preview ready (no music)")
-                                    return (output_file, total_duration)
+                    if self.music_tracks and len(self.music_tracks) > 0:
+                        if len(self.music_tracks) > 1:
+                            music_cmd = ["ffmpeg", "-y", "-v", "error"]
+                            music_filter = ""
+                            valid_tracks = []
+                            for track in self.music_tracks:
+                                if os.path.exists(track.file_path):
+                                    music_cmd.extend(["-i", track.file_path])
+                                    valid_tracks.append(track)
+                            if not valid_tracks:
+                                shutil.copy(output_file, final_output)
+                                output_file = final_output
                             else:
-                                # Just one track, use it directly
-                                temp_music_file = self.music_tracks[0].file_path
-                        elif self.music_file and os.path.exists(self.music_file):
-                            # Use legacy music file directly
-                            temp_music_file = self.music_file
+                                for i, track in enumerate(valid_tracks):
+                                    music_filter += f"[{i}:a]volume={track.volume}"
+                                    if track.start_time_in_track > 0 or track.duration:
+                                        music_filter += f",atrim=start={track.start_time_in_track}"
+                                        if track.duration:
+                                            music_filter += f":duration={track.duration}"
+                                    if track.start_time_in_compilation > 0:
+                                        music_filter += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
+                                    music_filter += f"[a{i}];"
+                                music_filter += "".join(f"[a{i}]" for i in range(len(valid_tracks))) + f"amix=inputs={len(valid_tracks)}:duration=longest[aout]"
+                                music_cmd.extend([
+                                    "-filter_complex", music_filter,
+                                    "-map", "[aout]",
+                                    "-c:a", "mp3", "-b:a", "192k",
+                                    temp_music_file
+                                ])
+                                music_process = subprocess.Popen(music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                music_process.wait(timeout=60)
+                                if not os.path.exists(temp_music_file) or os.path.getsize(temp_music_file) < 1000:
+                                    print("Failed to create mixed music file")
+                                    shutil.copy(output_file, final_output)
+                                    output_file = final_output
+                                else:
+                                    add_cmd = [
+                                        "ffmpeg", "-y", "-v", "error",
+                                        "-i", output_file, "-i", temp_music_file,
+                                        "-filter_complex", "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                        "-map", "0:v", "-map", "[a]",
+                                        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                                        "-shortest", final_output
+                                    ]
+                                    add_process = subprocess.Popen(add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                    add_process.wait(timeout=60)
+                                    if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                                        try:
+                                            os.unlink(output_file)
+                                            output_file = final_output
+                                            os.unlink(temp_music_file)
+                                        except:
+                                            pass
+                                    else:
+                                        shutil.copy(output_file, final_output)
+                                        output_file = final_output
                         else:
-                            # No valid music
-                            self.progress.emit(100, "Preview ready (no music)")
-                            return (output_file, total_duration)
-
-                        # Now add the music to the video
-                        final_output = os.path.join(
-                            TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
-                        )
-
-                        # Simple filter for adding music
-                        volume = self.music_volume
-                        if self.music_tracks and len(self.music_tracks) > 0:
-                            volume = 0.7  # Default if we mixed tracks
-
-                        add_cmd = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-i",
-                            output_file,
-                            "-i",
-                            temp_music_file,
-                            "-filter_complex",
-                            f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                            "-map",
-                            "0:v",
-                            "-map",
-                            "[a]",
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "128k",
-                            "-shortest",
-                            final_output,
-                        ]
-
-                        # Run with timeout
-                        add_process = subprocess.Popen(
-                            add_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
-
-                        start_time = time.time()
-                        while add_process.poll() is None:
-                            if self._abort:
-                                add_process.terminate()
-                                try:
-                                    if os.path.exists(final_output):
-                                        os.unlink(final_output)
-                                except:
-                                    pass
-                                return "Aborted"
-
-                            if time.time() - start_time > 60:
-                                add_process.terminate()
-                                print("Music addition timed out")
-                                break
-
-                            time.sleep(0.1)
-
-                        # Check result
-                        if (
-                            os.path.exists(final_output)
-                            and os.path.getsize(final_output) > 1000
-                        ):
-                            # Success! Use the music version
-                            try:
-                                # Remove original
-                                if os.path.exists(output_file):
-                                    os.unlink(output_file)
-
-                                # Clean up temp music file if we created it
-                                if (
-                                    self.music_tracks
-                                    and len(self.music_tracks) > 1
-                                    and temp_music_file != self.music_file
-                                ):
+                            if os.path.exists(self.music_tracks[0].file_path):
+                                add_cmd = [
+                                    "ffmpeg", "-y", "-v", "error",
+                                    "-i", output_file, "-i", self.music_tracks[0].file_path,
+                                    "-filter_complex", f"[1:a]volume={self.music_tracks[0].volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                    "-map", "0:v", "-map", "[a]",
+                                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                                    "-shortest", final_output
+                                ]
+                                add_process = subprocess.Popen(add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                add_process.wait(timeout=60)
+                                if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
                                     try:
-                                        os.unlink(temp_music_file)
+                                        os.unlink(output_file)
+                                        output_file = final_output
                                     except:
                                         pass
-
-                                # Use the music version
+                    elif self.music_file and os.path.exists(self.music_file):
+                        add_cmd = [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", output_file, "-i", self.music_file,
+                            "-filter_complex", f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map", "0:v", "-map", "[a]",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                            "-shortest", final_output
+                        ]
+                        add_process = subprocess.Popen(add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                        add_process.wait(timeout=60)
+                        if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                            try:
+                                os.unlink(output_file)
                                 output_file = final_output
-                            except Exception as e:
-                                print(f"Error finalizing music version: {e}")
-                                # If we can't clean up, just use what we have
-                                if os.path.exists(final_output):
-                                    output_file = final_output
-                        else:
-                            # Music addition failed, but we still have the original
-                            print("Failed to add music, using version without music")
-                    except Exception as e:
-                        print(f"Error in music processing: {e}")
-                        # Continue with no music
+                            except:
+                                pass
 
-            # Check if concat succeeded
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
-                self.progress.emit(
-                    100, "Preview ready" + (" with music" if self.music_file else "")
-                )
-                # Clean up individual files
+                self.progress.emit(100, "Preview ready" + (" with music" if self.music_file or self.music_tracks else ""))
                 for file in valid_files:
                     try:
                         if os.path.exists(file) and file != output_file:
@@ -1649,23 +1225,21 @@ class ProcessingWorker(QObject):
                         pass
                 return (output_file, total_duration)
             else:
-                # Try one last approach: just return the first clip
-                fallback_file = os.path.join(
-                    TEMP_DIR, f"fallback_preview_{uuid.uuid4().hex}.mp4"
-                )
-                try:
-                    shutil.copy(valid_files[0], fallback_file)
-                    self.progress.emit(100, "Preview ready (single clip fallback)")
-                    return (fallback_file, total_duration)
-                except Exception as e:
-                    print(f"Final fallback failed: {str(e)}")
-                    # Return one of the original files if possible
-                    if valid_files and os.path.exists(valid_files[0]):
-                        return (valid_files[0], total_duration)
-                    return "Error: Failed to create combined preview"
+                print("Error: Failed to create combined preview")
+                if valid_files:
+                    output_file = valid_files[0]  # Fallback
+                    self.progress.emit(100, "Preview ready (fallback to single clip)")
+                    return (output_file, total_duration)
+                return "Error: Failed to create combined preview"
 
         except Exception as e:
             print(f"Error in process_all_clips: {str(e)}")
+            for file in valid_files:
+                try:
+                    if os.path.exists(file):
+                        os.unlink(file)
+                except:
+                    pass
             return f"Error: {str(e)}"
 
     def export_video(self, items, output_path):
@@ -2251,7 +1825,8 @@ class ProcessingThread(QThread):
 
 class TimelineWidget(QWidget):
     """Interactive widget to display the timeline of clips with drag and zoom support"""
-
+    clip_selected = pyqtSignal(int)  # Emits the index of the selected clip
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.clips = []
@@ -2409,6 +1984,14 @@ class TimelineWidget(QWidget):
 
         self.update()
         event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+            if event.button() == Qt.LeftButton:
+                pixel_x = int(event.x() + self.scroll_offset)
+                clip_index = self.get_clip_at_position(pixel_x)
+                if clip_index != -1:
+                    self.clip_selected.emit(clip_index)
+            super().mouseDoubleClickEvent(event)
 
     def get_clip_at_position(self, pixel_x):
         """Get the index of the clip at the given pixel position"""
@@ -2722,56 +2305,64 @@ class VideoEffect:
         self.parameters = parameters or {}  # Parameters specific to the effect
 
     def get_ffmpeg_filter(self):
-        """Get the ffmpeg filter string for this effect"""
+        """Get the ffmpeg filter strings for this effect as (video_filter, audio_filter)."""
         if self.effect_type == "none":
-            return ""
+            return ("", "")
 
         if self.effect_type == "speed":
-            # Speed adjustment
             speed_factor = self.parameters.get("factor", 1.0)
+            if speed_factor <= 0 or speed_factor > 100:  # Arbitrary upper limit
+                print(f"Invalid speed factor: {speed_factor}, defaulting to 1.0")
+                speed_factor = 1.0
             if speed_factor == 1.0:
-                return ""
-
-            # For speed adjustments, audio and video need different treatments
-            if speed_factor > 1.0:
-                # Faster playback (speed up)
-                return f"setpts={1/speed_factor}*PTS,atempo={min(2.0, speed_factor)}"
-            else:
-                # Slower playback (slow down)
-                return f"setpts={1/speed_factor}*PTS,atempo={max(0.5, speed_factor)}"
+                return ("", "")
+            # Video speed adjustment using setpts
+            video_filter = f"setpts={1/speed_factor}*PTS"
+            # Audio speed adjustment with chained atempo filters (0.5x to 100x range)
+            audio_filters = []
+            remaining_speed = speed_factor
+            while remaining_speed > 2.0:
+                audio_filters.append("atempo=2.0")
+                remaining_speed /= 2.0
+            while remaining_speed < 0.5:
+                audio_filters.append("atempo=0.5")
+                remaining_speed *= 2.0
+            if remaining_speed != 1.0:
+                audio_filters.append(f"atempo={max(0.5, min(2.0, remaining_speed))}")
+            audio_filter = ",".join(audio_filters) if audio_filters else ""
+            return (video_filter, audio_filter)
 
         elif self.effect_type == "filter":
-            # Visual filter
+            # Visual filter (video only)
             filter_name = self.parameters.get("name", "")
-
             if filter_name == "grayscale":
-                return "hue=s=0"
+                return ("hue=s=0", "")
             elif filter_name == "sepia":
-                return (
-                    "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"
-                )
+                return ("colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131", "")
             elif filter_name == "vignette":
-                return "vignette=PI/4"
+                return ("vignette=PI/4", "")
             elif filter_name == "blur":
                 blur_amount = self.parameters.get("amount", 5)
-                return f"boxblur={blur_amount}:1"
+                return (f"boxblur={blur_amount}:1", "")
             elif filter_name == "sharpen":
-                return "unsharp=5:5:1.5:5:5:0.0"
+                return ("unsharp=5:5:1.5:5:5:0.0", "")
             elif filter_name == "noise":
-                return "noise=alls=20:allf=t"
+                return ("noise=alls=20:allf=t", "")
             elif filter_name == "contrast":
                 contrast = self.parameters.get("amount", 1.5)
-                return f"eq=contrast={contrast}"
+                return (f"eq=contrast={contrast}", "")
             elif filter_name == "brightness":
                 brightness = self.parameters.get("amount", 0.1)
-                return f"eq=brightness={brightness}"
+                return (f"eq=brightness={brightness}", "")
+            return ("", "")  # Default for unknown filters
 
         elif self.effect_type == "stabilize":
-            # Video stabilization (simplified version)
-            return "vidstabtransform=smoothing=10:input=/tmp/transforms.trf"
+            # Video stabilization (video only, requires prior vidstabdetect)
+            print("Warning: Stabilization requires vidstabdetect step, which is not implemented")
+            return ("vidstabtransform=smoothing=10:input=/tmp/transforms.trf", "")
 
         # Default case - no filter
-        return ""
+        return ("", "")
 
 
 class EffectsDialog(QDialog):
@@ -3589,6 +3180,8 @@ class VideoCompilationEditor(QMainWindow):
 
         self.timeline = TimelineWidget()
         right_layout.addWidget(self.timeline)
+        self.timeline.clip_selected.connect(self.select_clip_from_timeline)  # Connect signal
+        right_layout.addWidget(self.timeline)
 
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
@@ -3621,43 +3214,6 @@ class VideoCompilationEditor(QMainWindow):
         else:
             print("Media is not seekable")
 
-    def processing_finished(self, task, result):
-        """Handle processing thread completion with robust cleanup."""
-        self.is_processing = False
-        self.thread_active = False
-        if self.progress_dialog:
-            try:
-                self.progress_dialog.close()
-            except Exception as e:
-                print(f"Error closing progress dialog: {e}")
-            finally:
-                self.progress_dialog = None
-        if task == "preview_all" and self.preview_all_btn:
-            try:
-                self.preview_all_btn.setText("Preview All")
-                self.preview_all_btn.clicked.disconnect()
-                self.preview_all_btn.clicked.connect(self.preview_all)
-            except Exception as e:
-                print(f"Error resetting preview_all_btn: {e}")
-        elif task == "export" and self.export_btn:
-            try:
-                self.export_btn.setText("Export")
-                self.export_btn.clicked.disconnect()
-                self.export_btn.clicked.connect(self.export)
-            except Exception as e:
-                print(f"Error resetting export_btn: {e}")
-        if result == "Aborted":
-            self.status_label.setText("Historian: Operation canceled")
-        elif isinstance(result, str) and result.startswith("Error"):
-            self.status_label.setText("Historian: Operation failed")
-            QMessageBox.warning(self, "Error", result)
-        else:
-            self.status_label.setText(f"Historian: {task.capitalize()} completed")
-            if task == "preview_all" and isinstance(result, tuple):
-                self.preview_file = result[0]
-                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result[0])))
-                self.media_player.play()
-
     def zoom_in_timeline(self):
         if self.timeline:
             self.timeline.zoom_level = min(10.0, self.timeline.zoom_level * 1.25)
@@ -3678,39 +3234,15 @@ class VideoCompilationEditor(QMainWindow):
         self.update_timeline()
         self.preview_all_cache["signature"] = None
 
-    def cancel_processing(self):
-        """Cancel processing with robust thread and UI cleanup."""
-        if (
-            self.thread_active
-            and self.processing_thread
-            and self.processing_thread.isRunning()
-        ):
-            self.processing_thread.abort()
-            self.processing_thread.wait()
-        self.is_processing = False
-        self.thread_active = False
-        if self.progress_dialog:
-            try:
-                self.progress_dialog.close()
-            except Exception as e:
-                print(f"Error closing progress dialog: {e}")
-            finally:
-                self.progress_dialog = None
-        self.status_label.setText("Historian: Processing canceled")
-        if self.preview_all_btn:
-            try:
-                self.preview_all_btn.setText("Preview All")
-                self.preview_all_btn.clicked.disconnect()
-                self.preview_all_btn.clicked.connect(self.preview_all)
-            except Exception as e:
-                print(f"Error resetting preview_all_btn: {e}")
-        if self.export_btn:
-            try:
-                self.export_btn.setText("Export")
-                self.export_btn.clicked.disconnect()
-                self.export_btn.clicked.connect(self.export)
-            except Exception as e:
-                print(f"Error resetting export_btn: {e}")
+    def select_clip_from_timeline(self, clip_index):
+            """Select a clip in the clip_list based on timeline click."""
+            if 0 <= clip_index < self.clip_list.count():
+                self.clip_list.setCurrentRow(clip_index)
+                self.selection_changed()  # Ensure current_item syncs
+                # Optional: Scroll to the selected item in the list
+                item = self.clip_list.item(clip_index)
+                self.clip_list.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+                self.status_label.setText(f"Selected clip {clip_index + 1} from timeline")
 
     def media_state_changed(self, state):
         if self.play_button:
@@ -3767,12 +3299,94 @@ class VideoCompilationEditor(QMainWindow):
             print(f"Media player error: {error}")
 
     def update_progress(self, value, message):
-        if self.progress_dialog:
+        """Update progress dialog with thread-safe checks."""
+        # Double-check dialog existence and validity
+        if self.progress_dialog is not None and hasattr(self.progress_dialog, 'setLabelText'):
             try:
                 self.progress_dialog.setValue(value)
                 self.progress_dialog.setLabelText(message)
             except Exception as e:
                 print(f"Progress update error: {e}")
+        else:
+            print(f"Progress update skipped: No active dialog for '{message}'")
+
+    def cancel_processing(self):
+        """Cancel processing with robust thread and UI cleanup."""
+        if self.thread_active and self.processing_thread and self.processing_thread.isRunning():
+            self.processing_thread.abort()
+            self.processing_thread.wait()
+            # Disconnect progress signal to prevent late updates
+            try:
+                self.processing_thread.progress.disconnect()
+            except Exception:
+                pass  # Signal might not be connected
+        self.is_processing = False
+        self.thread_active = False
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except Exception as e:
+                print(f"Error closing progress dialog: {e}")
+            finally:
+                self.progress_dialog = None
+        self.status_label.setText("Historian: Processing canceled")
+        if self.preview_all_btn:
+            try:
+                self.preview_all_btn.setText("Preview All")
+                self.preview_all_btn.clicked.disconnect()
+                self.preview_all_btn.clicked.connect(self.preview_all)
+            except Exception as e:
+                print(f"Error resetting preview_all_btn: {e}")
+        if self.export_btn:
+            try:
+                self.export_btn.setText("Export")
+                self.export_btn.clicked.disconnect()
+                self.export_btn.clicked.connect(self.export)
+            except Exception as e:
+                print(f"Error resetting export_btn: {e}")
+
+    def processing_finished(self, task, result):
+        """Handle processing thread completion with robust cleanup."""
+        self.is_processing = False
+        self.thread_active = False
+        if self.processing_thread:
+            # Disconnect progress signal to prevent late updates
+            try:
+                self.processing_thread.progress.disconnect()
+            except Exception:
+                pass  # Signal might not be connected
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except Exception as e:
+                print(f"Error closing progress dialog: {e}")
+            finally:
+                self.progress_dialog = None
+        if task == "preview_all" and self.preview_all_btn:
+            try:
+                self.preview_all_btn.setText("Preview All")
+                self.preview_all_btn.clicked.disconnect()
+                self.preview_all_btn.clicked.connect(self.preview_all)
+            except Exception as e:
+                print(f"Error resetting preview_all_btn: {e}")
+        elif task == "export" and self.export_btn:
+            try:
+                self.export_btn.setText("Export")
+                self.export_btn.clicked.disconnect()
+                self.export_btn.clicked.connect(self.export)
+            except Exception as e:
+                print(f"Error resetting export_btn: {e}")
+        if result == "Aborted":
+            self.status_label.setText("Historian: Operation canceled")
+        elif isinstance(result, str) and result.startswith("Error"):
+            self.status_label.setText("Historian: Operation failed")
+            QMessageBox.warning(self, "Error", result)
+        else:
+            self.status_label.setText(f"Historian: {task.capitalize()} completed")
+            if task == "preview_all" and isinstance(result, tuple):
+                self.preview_file = result[0]
+                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result[0])))
+                self.media_player.play()
 
     def check_pending_changes(self):
         has_pending_changes = False
@@ -3797,15 +3411,21 @@ class VideoCompilationEditor(QMainWindow):
     def processing_error(self, task, error_msg):
         self.is_processing = False
         self.thread_active = False
+        if self.processing_thread:
+            try:
+                self.processing_thread.progress.disconnect()
+            except Exception:
+                pass
         if self.progress_dialog:
             try:
-                self.progress_dialog.close()
-            except:
-                pass
+                self.progress_dialog.reject()
+            except Exception as e:
+                print(f"Error closing progress dialog: {e}")
             finally:
                 self.progress_dialog = None
         self.status_label.setText(f"Error during {task}: {error_msg}")
         QMessageBox.warning(self, "Error", f"An error occurred: {error_msg}")
+        print(f"Full error details: {error_msg}")  # Log full ffmpeg error
 
     def play_with_external_player(self, video_file):
         try:
@@ -3972,25 +3592,28 @@ class VideoCompilationEditor(QMainWindow):
     def randomize_order(self):
         if self.clip_list.count() <= 1:
             return
-        items = [
-            (self.clip_list.item(i).text(), self.clip_list.item(i).data(Qt.UserRole))
-            for i in range(self.clip_list.count())
-        ]
+        items = [(self.clip_list.item(i).text(), self.clip_list.item(i).data(Qt.UserRole)) 
+                 for i in range(self.clip_list.count())]
         random.shuffle(items)
         self.clip_list.clear()
         for text, data in items:
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, data)
             self.clip_list.addItem(item)
+        # Update current_item to match new selection
+        if self.clip_list.count() > 0:
+            self.clip_list.setCurrentRow(0)  # Ensure selection updates
+            self.selection_changed()  # Sync self.current_item
         self.status_label.setText("Historian: Items shuffled")
         self.update_timeline()
         self.preview_all_cache["signature"] = None
+        # Improved toast handling
         toast = QMessageBox(self)
         toast.setWindowTitle("Historian")
         toast.setText("Clips randomized successfully.")
         toast.setStandardButtons(QMessageBox.NoButton)
         toast.show()
-        QTimer.singleShot(1500, toast.close)
+        QTimer.singleShot(1500, lambda: toast.accept())  # Properly terminate dialog
 
     def delete_selected(self):
         if not self.current_item:
@@ -4039,39 +3662,28 @@ class VideoCompilationEditor(QMainWindow):
 
     def preview_selected_item(self):
         if not self.current_item:
-            QMessageBox.information(
-                self, "No Selection", "Please select a media item to preview."
-            )
+            QMessageBox.information(self, "No Selection", "Please select a media item to preview.")
             return
         if self.is_processing:
-            QMessageBox.information(
-                self, "Processing", "Please wait for the current operation to complete."
-            )
+            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
             return
-        if (
-            not self.current_item.has_pending_changes
-            and self.current_item.preview_status == "ready"
-            and self.current_item.preview_file
-            and os.path.exists(self.current_item.preview_file)
-        ):
+        # Validate media item state
+        if self.current_item.start_time < 0 or (self.current_item.end_time is not None and self.current_item.end_time <= self.current_item.start_time):
+            print(f"Invalid time range for {self.current_item.file_path}: start={self.current_item.start_time}, end={self.current_item.end_time}")
+            self.current_item.start_time = 0
+            self.current_item.end_time = self.current_item.duration or 5.0
+        if (not self.current_item.has_pending_changes and self.current_item.preview_status == "ready" and
+                self.current_item.preview_file and os.path.exists(self.current_item.preview_file)):
             self.preview_file = self.current_item.preview_file
-            self.media_player.setMedia(
-                QMediaContent(QUrl.fromLocalFile(self.preview_file))
-            )
+            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.preview_file)))
             self.media_player.play()
-            self.status_label.setText(
-                f"Historian: Playing: {os.path.basename(self.current_item.file_path)}"
-            )
+            self.status_label.setText(f"Historian: Playing: {os.path.basename(self.current_item.file_path)}")
             return
         self.is_processing = True
         self.thread_active = True
         self.current_item.preview_status = "generating"
-        self.status_label.setText(
-            f"Historian: Creating preview for {os.path.basename(self.current_item.file_path)}..."
-        )
-        self.progress_dialog = QProgressDialog(
-            "Creating preview...", "Cancel", 0, 100, self
-        )
+        self.status_label.setText(f"Historian: Creating preview for {os.path.basename(self.current_item.file_path)}...")
+        self.progress_dialog = QProgressDialog("Creating preview...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
@@ -4085,31 +3697,19 @@ class VideoCompilationEditor(QMainWindow):
         self.processing_thread.start()
 
     def preview_all(self):
+        """Preview all items with robust thread initialization."""
         if self.clip_list.count() == 0:
-            QMessageBox.information(
-                self, "No Items", "Please add some media items first."
-            )
+            QMessageBox.information(self, "No Items", "Please add some media items first.")
             return
         if self.is_processing:
-            QMessageBox.information(
-                self, "Processing", "Please wait for the current operation to complete."
-            )
+            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
             return
-        items = [
-            self.clip_list.item(i).data(Qt.UserRole)
-            for i in range(self.clip_list.count())
-        ]
+        items = [self.clip_list.item(i).data(Qt.UserRole) for i in range(self.clip_list.count())]
         need_new_preview = self.check_pending_changes()
-        if (
-            not need_new_preview
-            and self.preview_all_cache["path"]
-            and os.path.exists(self.preview_all_cache["path"])
-        ):
+        if not need_new_preview and self.preview_all_cache["path"] and os.path.exists(self.preview_all_cache["path"]):
             self.preview_file = self.preview_all_cache["path"]
             self.status_label.setText("Historian: Playing: All items (cached)")
-            self.media_player.setMedia(
-                QMediaContent(QUrl.fromLocalFile(self.preview_file))
-            )
+            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.preview_file)))
             self.media_player.play()
             return
         self.update_timeline()
@@ -4123,9 +3723,7 @@ class VideoCompilationEditor(QMainWindow):
                 self.preview_all_btn.clicked.connect(self.cancel_processing)
             except Exception as e:
                 print(f"Error updating preview_all_btn: {e}")
-        self.progress_dialog = QProgressDialog(
-            "Creating preview...", "Cancel", 0, 100, self
-        )
+        self.progress_dialog = QProgressDialog("Creating preview...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
@@ -4145,33 +3743,23 @@ class VideoCompilationEditor(QMainWindow):
         self.processing_thread.start()
 
     def export(self):
+        """Export compilation with robust thread initialization."""
         if self.clip_list.count() == 0:
-            QMessageBox.information(
-                self, "No Items", "Please add some media items first."
-            )
+            QMessageBox.information(self, "No Items", "Please add some media items first.")
             return
         if self.is_processing:
-            QMessageBox.information(
-                self, "Processing", "Please wait for the current operation to complete."
-            )
+            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
             return
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Compilation", "", "Video Files (*.mp4)"
-        )
+        output_path, _ = QFileDialog.getSaveFileName(self, "Save Compilation", "", "Video Files (*.mp4)")
         if not output_path:
             return
         if not output_path.lower().endswith(".mp4"):
             output_path += ".mp4"
-        items = [
-            self.clip_list.item(i).data(Qt.UserRole)
-            for i in range(self.clip_list.count())
-        ]
+        items = [self.clip_list.item(i).data(Qt.UserRole) for i in range(self.clip_list.count())]
         self.is_processing = True
         self.thread_active = True
         self.status_label.setText("Exporting...")
-        self.progress_dialog = QProgressDialog(
-            "Exporting video...", "Cancel", 0, 100, self
-        )
+        self.progress_dialog = QProgressDialog("Exporting video...", "Cancel", 0, 100, self)
         self.progress_dialog.setWindowTitle("Export")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
@@ -4249,32 +3837,49 @@ class VideoCompilationEditor(QMainWindow):
             self.timeline.update()
 
     def update_timeline(self):
+        """Update timeline with debouncing and safety checks."""
         if self.clip_list.count() == 0:
-            self.timeline.set_clips([])
+            if self.timeline and self.timeline.isVisible():
+                self.timeline.set_clips([])
+            return
+        if not self.timeline or not self.timeline.isVisible():
+            print("Timeline widget not available or hidden")
+            return
+        # Debounce by checking if already scheduled
+        if hasattr(self, '_timeline_update_pending') and self._timeline_update_pending:
+            return
+        self._timeline_update_pending = True
+        QTimer.singleShot(100, self._do_update_timeline)  # Delay update by 100ms
+
+    def _do_update_timeline(self):
+        """Internal method to perform timeline update."""
+        if not hasattr(self, '_timeline_update_pending') or not self._timeline_update_pending:
             return
         timeline_clips = []
         current_time = 0
         for i in range(self.clip_list.count()):
             media_item = self.clip_list.item(i).data(Qt.UserRole)
-            duration = (
-                media_item.display_duration
-                if media_item.is_image
-                else (media_item.end_time or media_item.duration)
-                - media_item.start_time
-            )
-            timeline_clips.append(
-                {
-                    "name": os.path.basename(media_item.file_path),
-                    "duration": duration,
-                    "start_time": current_time,
-                    "is_image": media_item.is_image,
-                    "has_pending_changes": media_item.has_pending_changes,
-                }
-            )
+            duration = media_item.display_duration if media_item.is_image else (
+                media_item.end_time or media_item.duration) - media_item.start_time
+            if duration < 0:  # Validate duration
+                print(f"Warning: Invalid duration for {media_item.file_path}: {duration}")
+                duration = 0.1  # Minimum duration to prevent ffmpeg errors
+            timeline_clips.append({
+                "name": os.path.basename(media_item.file_path),
+                "duration": duration,
+                "start_time": current_time,
+                "is_image": media_item.is_image,
+                "has_pending_changes": media_item.has_pending_changes,
+            })
             current_time += duration
-        self.timeline.set_clips(timeline_clips)
-        self.timeline.set_music_tracks(self.music_tracks)
-        self.timeline.update()
+        if self.timeline:
+            try:
+                self.timeline.set_clips(timeline_clips)
+                self.timeline.set_music_tracks(self.music_tracks)
+                self.timeline.update()
+            except Exception as e:
+                print(f"Error updating timeline: {e}")
+        self._timeline_update_pending = False
 
 
 # Add the main execution point at the end of the file
