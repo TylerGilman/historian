@@ -145,7 +145,7 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 90  # Default manual rotation (0 degrees)
+        self.manual_rotation = 0  # Default manual rotation (0 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
