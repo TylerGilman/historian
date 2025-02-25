@@ -146,7 +146,7 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 90  # Default manual rotation (90 degrees)
+        self.manual_rotation = 0  # Default manual rotation (89 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
@@ -787,6 +787,22 @@ class ProcessingWorker(QObject):
             self.progress.emit(0, f"Error: {str(e)}")
             media_item.preview_status = "error"
             return f"Error: {str(e)}"
+
+    def slider_released(self):
+        """Handle slider release event"""
+        self.position_slider_being_dragged = False
+        self.set_position(self.position_slider.value())  # Only set position on release
+
+    def update_progress(self, value, message):
+        """Update progress dialog"""
+        if self.progress_dialog is not None:
+            try:
+                self.progress_dialog.setValue(value)
+                self.progress_dialog.setLabelText(message)
+            except Exception as e:
+                print(f"Progress update error: {e}")
+        else:
+            print(f"Progress update skipped: No active dialog for '{message}'")
 
     def process_all_clips(self, items):
         """Process all clips for preview - optimized for speed with HW acceleration"""
@@ -3341,14 +3357,16 @@ class MusicEditorDialog(QDialog):
 class VideoCompilationEditor(QMainWindow):
     def __init__(self):
         super().__init__()
-
-        # Clean up any old temp files
+        # Clean up temp files on startup
         cleanup_temp_dirs()
 
-        # Set window icon (assuming historian_icon.png exists in your project directory)
-        self.setWindowIcon(QIcon("historian_icon.png"))
+        # Set window properties
+        self.setWindowTitle("Historian Video Editor")
+        self.setGeometry(100, 100, 1200, 720)
+        self.setMinimumSize(900, 600)
+        self.setWindowIcon(QIcon("historian_icon.png"))  # Ensure icon exists
 
-        # Setup media player for previews
+        # Media player setup
         self.media_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.video_widget = QVideoWidget()
         self.media_player.setVideoOutput(self.video_widget)
@@ -3357,207 +3375,135 @@ class VideoCompilationEditor(QMainWindow):
         self.media_player.durationChanged.connect(self.duration_changed)
         self.media_player.error.connect(self.handle_player_error)
 
-        # Track state
+        # State tracking
         self.preview_file = None
         self.current_item = None
         self.default_image_duration = 5.0
         self.position_slider_being_dragged = False
         self.progress_dialog = None
         self.is_processing = False
-
-        # Preview all cache
+        self.thread_active = False  # Track thread status
         self.preview_all_cache = {"signature": None, "path": None, "total_duration": 0}
+        self.music_file = None
+        self.music_volume = 0.7
+        self.music_tracks = []
+        self.has_pending_music_changes = False
 
-        # Background music
-        self.music_file = None  # Keep for backward compatibility
-        self.music_volume = 0.7  # Default 70% volume
-        self.music_tracks = []  # List of MusicTrack objects
-        self.has_pending_music_changes = False  # Flag for music changes
+        # Critical UI elements initialized here for persistence
+        self.preview_all_btn = QPushButton("Preview All")
+        self.preview_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.preview_all_btn.setMinimumSize(140, 48)
+        self.preview_all_btn.clicked.connect(self.preview_all)
 
-        # Create processing thread
-        self.processing_thread = ProcessingThread(self)
-        self.processing_thread.progress.connect(self.update_progress)
-        self.processing_thread.finished.connect(self.processing_finished)
-        self.processing_thread.error.connect(self.processing_error)
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.export_btn.setMinimumSize(140, 48)
+        self.export_btn.clicked.connect(self.export)
 
-        # Initialize UI
+        # Processing thread
+        self.processing_thread = None  # Initialized on demand
+
+        # UI setup
         self.setup_ui()
 
     def setup_ui(self):
-        """Set up the user interface"""
-        self.setWindowTitle("Video Compilation Editor")
-        self.setGeometry(100, 100, 1200, 720)
-        self.setMinimumSize(900, 600)
-
-        self.setWindowTitle("Historian Video Editor")
-
-        # Apply Historian branding styling
-        self.setStyleSheet(
-            """
-            QMainWindow, QDialog {
-                background-color: #F5E8C7;  /* Parchment beige background */
-            }
-            QLabel {
-                color: #5C4033;  /* Deep brown text */
-                font-family: 'Georgia', serif;  /* Rustic, classic font */
-            }
-            QPushButton {
-                background-color: #5C4033;  /* Deep brown buttons */
-                color: #F5E8C7;  /* Beige text */
-                border: 1px solid #3A2E22;  /* Darker brown border */
-                padding: 8px 16px;
-                border-radius: 4px;
-                font-family: 'Georgia', serif;
-            }
-            QPushButton:hover {
-                background-color: #7A5845;  /* Lighter brown on hover */
-            }
-            QPushButton:pressed {
-                background-color: #468C87;  /* Muted teal when pressed */
-            }
-            QPushButton:disabled {
-                background-color: #A89F91;  /* Muted gray-brown */
-                color: #D9CDB8;
-            }
-            QListWidget {
-                background-color: #FFF8E8;  /* Light parchment */
-                border: 1px solid #A89F91;  /* Soft gray-brown border */
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid #E8DCC8;  /* Subtle line */
-                color: #5C4033;
-            }
-            QListWidget::item:selected {
-                background-color: #468C87;  /* Muted teal selection */
-                color: #F5E8C7;
-            }
-            QToolButton {
-                background-color: #5C4033;
-                color: #F5E8C7;
-                border: none;
-                border-radius: 4px;
-            }
-            QToolButton:hover {
-                background-color: #7A5845;
-            }
-            QFrame#statusFrame {
-                background-color: #E8DCC8;  /* Slightly darker parchment */
-                border: 1px solid #A89F91;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #A89F91;  /* Gray-brown groove */
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #5C4033;  /* Brown handle */
-                border: 1px solid #3A2E22;
-                width: 14px;
-                height: 14px;
-                margin: -4px 0;
-                border-radius: 7px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #468C87;  /* Teal progress */
-                border-radius: 3px;
-            }
-            QProgressDialog {
-                background-color: #FFF8E8;
-                border: 1px solid #A89F91;
-            }
-            QProgressDialog QLabel {
-                font-size: 14px;
-                padding: 8px;
-                color: #5C4033;
-            }
-            QProgressDialog QPushButton {
-                background-color: #7A5845;  /* Cancel button */
-            }
-            """
-        )
-
-        # Central widget
+        """Set up the user interface with improved structure."""
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-
-        # Main layout
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
-        # Top toolbar
+        # Toolbar
         toolbar = QHBoxLayout()
-
-        # Add files buttons
-        add_videos_btn = QPushButton("Add Videos")
-        add_videos_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogStart))
+        add_videos_btn = QPushButton(
+            "Add Videos", icon=self.style().standardIcon(QStyle.SP_FileDialogStart)
+        )
         add_videos_btn.clicked.connect(self.add_videos)
+        add_videos_btn.setMinimumSize(120, 40)
+        add_videos_btn.setToolTip("Add video files to the compilation")
 
-        add_images_btn = QPushButton("Add Images")
-        add_images_btn.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
+        add_images_btn = QPushButton(
+            "Add Images", icon=self.style().standardIcon(QStyle.SP_DirIcon)
+        )
         add_images_btn.clicked.connect(self.add_images)
+        add_images_btn.setMinimumSize(120, 40)
+        add_images_btn.setToolTip("Add image files to the compilation")
+
+        edit_btn = QPushButton(
+            "Edit", icon=self.style().standardIcon(QStyle.SP_FileDialogDetailedView)
+        )
+        edit_btn.clicked.connect(self.edit_selected)
+        edit_btn.setMinimumSize(100, 32)
+        edit_btn.setToolTip("Edit selected media properties")
+
+        delete_btn = QPushButton(
+            "Remove", icon=self.style().standardIcon(QStyle.SP_TrashIcon)
+        )
+        delete_btn.clicked.connect(self.delete_selected)
+        delete_btn.setMinimumSize(100, 32)
+        delete_btn.setToolTip("Remove selected media item")
+
+        randomize_btn = QPushButton(
+            "Shuffle", icon=self.style().standardIcon(QStyle.SP_BrowserReload)
+        )
+        randomize_btn.clicked.connect(self.randomize_order)
+        randomize_btn.setMinimumSize(100, 32)
+        randomize_btn.setToolTip("Randomize order of media items")
+
+        add_music_btn = QPushButton(
+            "Add Music", icon=self.style().standardIcon(QStyle.SP_MediaVolume)
+        )
+        add_music_btn.clicked.connect(self.add_music)
+        add_music_btn.setMinimumSize(120, 40)
+        add_music_btn.setToolTip("Add background music tracks")
 
         toolbar.addWidget(add_videos_btn)
         toolbar.addWidget(add_images_btn)
-
-        # Clip management buttons
-        edit_btn = QPushButton("Edit")
-        edit_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
-        edit_btn.clicked.connect(self.edit_selected)
-
-        delete_btn = QPushButton("Remove")
-        delete_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-        delete_btn.clicked.connect(self.delete_selected)
-
-        randomize_btn = QPushButton("Shuffle")
-        randomize_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
-        randomize_btn.clicked.connect(self.randomize_order)
-
         toolbar.addWidget(edit_btn)
         toolbar.addWidget(delete_btn)
         toolbar.addWidget(randomize_btn)
-
-        # Export button
         toolbar.addStretch()
-
-        # Add Music button
-        add_music_btn = QPushButton("Add Music")
-        add_music_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
-        add_music_btn.clicked.connect(self.add_music)
         toolbar.addWidget(add_music_btn)
-
-        preview_all_btn = QPushButton("Preview All")
-        preview_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        preview_all_btn.clicked.connect(self.preview_all)
-
-        export_btn = QPushButton("Export")
-        export_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
-        export_btn.clicked.connect(self.export)
-
-        toolbar.addWidget(preview_all_btn)
-        toolbar.addWidget(export_btn)
-
+        toolbar.addWidget(self.preview_all_btn)
+        toolbar.addWidget(self.export_btn)
         main_layout.addLayout(toolbar)
+
+        # Apply stylesheet (unchanged from original)
+        self.setStyleSheet(
+            """
+            QMainWindow, QDialog { background-color: #F8F1E9; }
+            QLabel { color: #2E2E2E; font-family: 'Times New Roman', serif; font-size: 12px; }
+            QPushButton { background-color: #2E2E2E; color: #F8F1E9; border: 2px solid #D4A017; padding: 6px 12px; border-radius: 6px; font-family: 'Times New Roman', serif; font-size: 14px; font-weight: bold; }
+            QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A3A3A, stop:1 #2E2E2E); color: #D4A017; }
+            QPushButton:pressed { background-color: #D4A017; color: #2E2E2E; border: 2px solid #5C4033; padding: 8px 14px; }
+            QPushButton:disabled { background-color: #A0A0A0; color: #D9D9D9; border: 2px solid #A0A0A0; }
+            QListWidget { background-color: #FFFFFF; border: 1px solid #D4A017; border-radius: 4px; padding: 5px; font-family: 'Roboto', sans-serif; }
+            QListWidget::item { padding: 8px; border-bottom: 1px solid #E8E8E8; color: #2E2E2E; }
+            QListWidget::item:selected { background-color: #D4A017; color: #F8F1E9; }
+            QToolButton { background-color: #2E2E2E; color: #F8F1E9; border: 1px solid #D4A017; border-radius: 4px; }
+            QToolButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3A3A3A, stop:1 #2E2E2E); color: #D4A017; }
+            QFrame#statusFrame { background-color: #F0E9E0; border: 1px solid #D4A017; border-radius: 4px; padding: 5px; }
+            QSlider::groove:horizontal { height: 6px; background: #E8E8E8; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #D4A017; border: 1px solid #2E2E2E; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #5C4033; border-radius: 3px; }
+            QProgressDialog { background-color: #FFFFFF; border: 1px solid #D4A017; }
+            QProgressDialog QLabel { font-size: 14px; padding: 8px; color: #2E2E2E; font-family: 'Times New Roman', serif; }
+            QProgressDialog QPushButton { background-color: #5C4033; color: #F8F1E9; border: 1px solid #D4A017; }
+            QProgressDialog QPushButton:hover { background-color: #7A5845; }
+        """
+        )
 
         # Main content splitter
         splitter = QSplitter(Qt.Horizontal)
-
-        # Left panel - media list
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Media list header
         list_label = QLabel("Media Items")
         list_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         left_layout.addWidget(list_label)
 
-        # Media list
         self.clip_list = QListWidget()
         self.clip_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.clip_list.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -3566,85 +3512,72 @@ class VideoCompilationEditor(QMainWindow):
         self.clip_list.model().rowsMoved.connect(self.on_items_reordered)
         left_layout.addWidget(self.clip_list)
 
-        # Preview button for selected item
-        preview_btn = QPushButton("Preview Selected")
-        preview_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        preview_btn = QPushButton(
+            "Preview Selected", icon=self.style().standardIcon(QStyle.SP_MediaPlay)
+        )
         preview_btn.clicked.connect(self.preview_selected_item)
+        preview_btn.setToolTip("Preview the selected media item")
         left_layout.addWidget(preview_btn)
 
-        # Right panel - preview
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Preview section
         preview_label = QLabel("Preview")
         preview_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         right_layout.addWidget(preview_label)
 
-        # Add video widget
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout.addWidget(self.video_widget)
 
-        # Playback controls
         playback_layout = QHBoxLayout()
-
-        # Play button
         self.play_button = QToolButton()
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_button.setIconSize(QSize(24, 24))
         self.play_button.setFixedSize(36, 36)
         self.play_button.clicked.connect(self.play_pause)
+        self.play_button.setToolTip("Play/Pause video")
 
-        # Stop button
         self.stop_button = QToolButton()
         self.stop_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
         self.stop_button.setIconSize(QSize(24, 24))
         self.stop_button.setFixedSize(36, 36)
         self.stop_button.clicked.connect(self.stop)
+        self.stop_button.setToolTip("Stop video playback")
 
-        # Position slider
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setRange(0, 0)
-        # Remove sliderMoved connection to prevent continuous updates
-        # self.position_slider.sliderMoved.connect(self.set_position)  # Removed
         self.position_slider.sliderPressed.connect(self.slider_pressed)
         self.position_slider.sliderReleased.connect(self.slider_released)
+        self.position_slider.setToolTip("Seek through the video")
 
-        # Time label
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.time_label.setMinimumWidth(80)
 
-        # Add to layout
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.stop_button)
         playback_layout.addWidget(self.position_slider)
         playback_layout.addWidget(self.time_label)
-
         right_layout.addLayout(playback_layout)
-        # Add timeline widget for visualization
+
         timeline_header = QHBoxLayout()
         timeline_label = QLabel("Timeline:")
         timeline_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-
         timeline_help = QLabel("(Drag to scroll, Ctrl+Wheel to zoom)")
         timeline_help.setStyleSheet("font-size: 10px; color: #888;")
-
         zoom_out_btn = QPushButton("-")
         zoom_out_btn.setFixedWidth(30)
-        zoom_out_btn.setToolTip("Zoom Out")
         zoom_out_btn.clicked.connect(self.zoom_out_timeline)
-
+        zoom_out_btn.setToolTip("Zoom out timeline")
         zoom_fit_btn = QPushButton("Fit")
         zoom_fit_btn.setFixedWidth(40)
-        zoom_fit_btn.setToolTip("Fit to View")
         zoom_fit_btn.clicked.connect(self.zoom_fit_timeline)
-
+        zoom_fit_btn.setToolTip("Fit timeline to view")
         zoom_in_btn = QPushButton("+")
         zoom_in_btn.setFixedWidth(30)
-        zoom_in_btn.setToolTip("Zoom In")
         zoom_in_btn.clicked.connect(self.zoom_in_timeline)
+        zoom_in_btn.setToolTip("Zoom in timeline")
 
         timeline_header.addWidget(timeline_label)
         timeline_header.addWidget(timeline_help)
@@ -3652,296 +3585,235 @@ class VideoCompilationEditor(QMainWindow):
         timeline_header.addWidget(zoom_out_btn)
         timeline_header.addWidget(zoom_fit_btn)
         timeline_header.addWidget(zoom_in_btn)
-
         right_layout.addLayout(timeline_header)
 
         self.timeline = TimelineWidget()
         right_layout.addWidget(self.timeline)
 
-        # Add panels to splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([300, 700])
-
         main_layout.addWidget(splitter, 1)
 
-        # Status bar
         status_frame = QFrame()
         status_frame.setObjectName("statusFrame")
         status_layout = QHBoxLayout(status_frame)
         status_layout.setContentsMargins(10, 5, 10, 5)
 
-        self.status_label = QLabel("Historian: Ready")  # Updated with branding
+        self.status_label = QLabel("Historian: Ready")
         self.status_label.setStyleSheet("font-weight: bold;")
         status_layout.addWidget(self.status_label)
 
-        # Changes indicator
         self.changes_indicator = QLabel("")
-        self.changes_indicator.setStyleSheet(
-            "color: #7A5845;"
-        )  # Match brown hover color
+        self.changes_indicator.setStyleSheet("color: #7A5845;")
         status_layout.addWidget(self.changes_indicator, 0, Qt.AlignRight)
-
         main_layout.addWidget(status_frame)
 
+    def set_position(self, position):
+        """Set media position with safe seeking."""
+        if self.media_player.isSeekable():
+            was_playing = self.media_player.state() == QMediaPlayer.PlayingState
+            if was_playing:
+                self.media_player.pause()
+            self.media_player.setPosition(position)
+            if was_playing:
+                QTimer.singleShot(100, self.media_player.play)
+        else:
+            print("Media is not seekable")
+
+    def processing_finished(self, task, result):
+        """Handle processing thread completion with robust cleanup."""
+        self.is_processing = False
+        self.thread_active = False
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except Exception as e:
+                print(f"Error closing progress dialog: {e}")
+            finally:
+                self.progress_dialog = None
+        if task == "preview_all" and self.preview_all_btn:
+            try:
+                self.preview_all_btn.setText("Preview All")
+                self.preview_all_btn.clicked.disconnect()
+                self.preview_all_btn.clicked.connect(self.preview_all)
+            except Exception as e:
+                print(f"Error resetting preview_all_btn: {e}")
+        elif task == "export" and self.export_btn:
+            try:
+                self.export_btn.setText("Export")
+                self.export_btn.clicked.disconnect()
+                self.export_btn.clicked.connect(self.export)
+            except Exception as e:
+                print(f"Error resetting export_btn: {e}")
+        if result == "Aborted":
+            self.status_label.setText("Historian: Operation canceled")
+        elif isinstance(result, str) and result.startswith("Error"):
+            self.status_label.setText("Historian: Operation failed")
+            QMessageBox.warning(self, "Error", result)
+        else:
+            self.status_label.setText(f"Historian: {task.capitalize()} completed")
+            if task == "preview_all" and isinstance(result, tuple):
+                self.preview_file = result[0]
+                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result[0])))
+                self.media_player.play()
+
     def zoom_in_timeline(self):
-        """Zoom in on the timeline"""
-        self.timeline.zoom_level = min(10.0, self.timeline.zoom_level * 1.25)
-        self.timeline.update()
+        if self.timeline:
+            self.timeline.zoom_level = min(10.0, self.timeline.zoom_level * 1.25)
+            self.timeline.update()
 
     def zoom_out_timeline(self):
-        """Zoom out on the timeline"""
-        self.timeline.zoom_level = max(0.1, self.timeline.zoom_level / 1.25)
-        self.timeline.update()
+        if self.timeline:
+            self.timeline.zoom_level = max(0.1, self.timeline.zoom_level / 1.25)
+            self.timeline.update()
 
     def zoom_fit_timeline(self):
-        """Reset zoom to fit all clips in view"""
-        self.timeline.zoom_level = 1.0
-        self.timeline.scroll_offset = 0
-        self.timeline.update()
+        if self.timeline:
+            self.timeline.zoom_level = 1.0
+            self.timeline.scroll_offset = 0
+            self.timeline.update()
 
     def on_items_reordered(self):
-        """Handle list reordering event"""
         self.update_timeline()
-        self.preview_all_cache["signature"] = None  # Invalidate preview cache
+        self.preview_all_cache["signature"] = None
 
     def cancel_processing(self):
-        """Cancel the current processing operation"""
-        if self.processing_thread.isRunning():
+        """Cancel processing with robust thread and UI cleanup."""
+        if (
+            self.thread_active
+            and self.processing_thread
+            and self.processing_thread.isRunning()
+        ):
             self.processing_thread.abort()
-            self.status_label.setText("Processing canceled")
+            self.processing_thread.wait()
+        self.is_processing = False
+        self.thread_active = False
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except Exception as e:
+                print(f"Error closing progress dialog: {e}")
+            finally:
+                self.progress_dialog = None
+        self.status_label.setText("Historian: Processing canceled")
+        if self.preview_all_btn:
+            try:
+                self.preview_all_btn.setText("Preview All")
+                self.preview_all_btn.clicked.disconnect()
+                self.preview_all_btn.clicked.connect(self.preview_all)
+            except Exception as e:
+                print(f"Error resetting preview_all_btn: {e}")
+        if self.export_btn:
+            try:
+                self.export_btn.setText("Export")
+                self.export_btn.clicked.disconnect()
+                self.export_btn.clicked.connect(self.export)
+            except Exception as e:
+                print(f"Error resetting export_btn: {e}")
 
     def media_state_changed(self, state):
-        """Handle media player state changes"""
-        if state == QMediaPlayer.PlayingState:
-            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
-        else:
-            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        if self.play_button:
+            if state == QMediaPlayer.PlayingState:
+                self.play_button.setIcon(
+                    self.style().standardIcon(QStyle.SP_MediaPause)
+                )
+            else:
+                self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
     def play_pause(self):
-        """Toggle play/pause state"""
         if self.media_player.state() == QMediaPlayer.PlayingState:
             self.media_player.pause()
         else:
             self.media_player.play()
 
     def stop(self):
-        """Stop playback"""
         self.media_player.stop()
 
     def position_changed(self, position):
-        """Update position slider and time label"""
-        if not self.position_slider_being_dragged:
+        if not self.position_slider_being_dragged and self.position_slider:
             self.position_slider.setValue(position)
-
         duration = self.media_player.duration()
-        if duration > 0:
+        if duration > 0 and self.time_label:
             position_sec = position / 1000.0
             duration_sec = duration / 1000.0
             self.time_label.setText(
                 f"{int(position_sec // 60)}:{int(position_sec % 60):02d} / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
             )
-
-            # Update timeline position
-            self.timeline.set_position(position_sec)
+            if self.timeline:
+                self.timeline.set_position(position_sec)
 
     def duration_changed(self, duration):
-        """Update slider range when media duration changes"""
-        self.position_slider.setRange(0, duration)
-
-        # Set the time label with correct total time
-        if duration > 0:
+        if self.position_slider and duration > 0:
+            self.position_slider.setRange(0, duration)
             duration_sec = duration / 1000.0
             self.time_label.setText(
                 f"0:00 / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
             )
 
     def slider_pressed(self):
-        """Handle slider press event"""
         self.position_slider_being_dragged = True
-        # Optionally pause playback to prevent glitches during dragging
         if self.media_player.state() == QMediaPlayer.PlayingState:
             self.media_player.pause()
 
     def slider_released(self):
-        """Handle slider release event"""
         self.position_slider_being_dragged = False
-        self.set_position(self.position_slider.value())  # Only set position on release
+        if self.position_slider:
+            self.set_position(self.position_slider.value())
 
     def handle_player_error(self, error):
-        """Handle media player errors"""
         if error != QMediaPlayer.NoError:
             self.status_label.setText(f"Media player error: {error}")
             print(f"Media player error: {error}")
 
     def update_progress(self, value, message):
-        """Update progress dialog"""
-        if self.progress_dialog is not None:
+        if self.progress_dialog:
             try:
                 self.progress_dialog.setValue(value)
                 self.progress_dialog.setLabelText(message)
             except Exception as e:
-                # Handle case where dialog might be closed during update
                 print(f"Progress update error: {e}")
-                pass
 
     def check_pending_changes(self):
-        """Check for pending changes and update UI indicators"""
         has_pending_changes = False
-
-        # Check all media items
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
             media_item = item.data(Qt.UserRole)
             if media_item.has_pending_changes:
                 has_pending_changes = True
                 break
-
-        # Check if music has changed since last preview/export
         if self.has_pending_music_changes:
             has_pending_changes = True
-
-        # Update UI indicators
         if has_pending_changes:
             self.changes_indicator.setText("⚠️ Pending changes - preview to see updates")
-            self.timeline.set_pending_changes(True)
+            if self.timeline:
+                self.timeline.set_pending_changes(True)
         else:
             self.changes_indicator.setText("")
-            self.timeline.set_pending_changes(False)
-
-            return has_pending_changes
-
-    def processing_finished(self, task, result):
-        """Handle processing thread completion"""
-
-        self.is_processing = False
-
-        # Clear progress dialog safely
-        if self.progress_dialog:
-            try:
-                self.progress_dialog.close()
-            except:
-                pass
-            self.progress_dialog = None
-
-        # Check if it's an error or aborted
-        if result == "Aborted":
-            self.status_label.setText("Operation canceled")
-            return
-
-        if isinstance(result, str) and result.startswith("Error"):
-            self.status_label.setText("Operation failed")
-            QMessageBox.warning(self, "Error", result)
-            return
-
-        # Success cases - check task
-        if task == "preview_item":
-            if os.path.exists(result) and os.path.getsize(result) > 1000:
-                # Valid preview file
-                self.preview_file = result
-                self.status_label.setText(
-                    f"Playing: {os.path.basename(self.current_item.file_path)}"
-                )
-                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result)))
-                self.media_player.play()
-
-                # Clear pending changes flag for this item
-                self.current_item.has_pending_changes = False
-                self.check_pending_changes()
-            else:
-                self.status_label.setText("Preview failed - invalid output file")
-
-        elif task == "preview_all":
-            # For preview_all, result is a tuple (file_path, duration)
-            output_file = result
-            if isinstance(result, tuple) and len(result) == 2:
-                output_file = result[0]
-
-            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
-                # Valid preview file
-                self.preview_file = output_file
-                self.status_label.setText("Playing: All items")
-                self.media_player.setMedia(
-                    QMediaContent(QUrl.fromLocalFile(output_file))
-                )
-                self.media_player.play()
-
-                # Clear all pending changes flags
-                for i in range(self.clip_list.count()):
-                    item = self.clip_list.item(i)
-                    media_item = item.data(Qt.UserRole)
-                    media_item.has_pending_changes = False
-
-                # Clear music changes flag too
-                self.has_pending_music_changes = False
-
-                # Update change indicators
-                self.check_pending_changes()
-            else:
-                self.status_label.setText("Preview failed - invalid output file")
-
-        elif task == "export":
-            if os.path.exists(result) and os.path.getsize(result) > 1000:
-                # Valid export file
-                self.status_label.setText("Export completed successfully")
-                QMessageBox.information(
-                    self,
-                    "Export Complete",
-                    f"The compilation has been saved to:\n{result}",
-                )
-
-                # Clear all pending changes flags
-                for i in range(self.clip_list.count()):
-                    item = self.clip_list.item(i)
-                    media_item = item.data(Qt.UserRole)
-                    media_item.has_pending_changes = False
-
-                # Clear music changes flag too
-                self.has_pending_music_changes = False
-
-                # Update change indicators
-                self.check_pending_changes()
-            else:
-                self.status_label.setText("Export failed - invalid output file")
-
-    def set_position(self, position):
-        """Set media position from slider, ensuring safe seeking"""
-        if self.media_player.isSeekable():  # Check if the media supports seeking
-            was_playing = self.media_player.state() == QMediaPlayer.PlayingState
-            if was_playing:
-                self.media_player.pause()  # Pause to stabilize seeking
-            self.media_player.setPosition(position)
-            if was_playing:
-                QTimer.singleShot(
-                    100, self.media_player.play
-                )  # Resume after a short delay
-        else:
-            print("Media is not seekable")
+            if self.timeline:
+                self.timeline.set_pending_changes(False)
+        return has_pending_changes
 
     def processing_error(self, task, error_msg):
-        """Handle processing thread error"""
         self.is_processing = False
-
-        # Clear progress dialog safely
+        self.thread_active = False
         if self.progress_dialog:
             try:
                 self.progress_dialog.close()
             except:
                 pass
-            self.progress_dialog = None
-
+            finally:
+                self.progress_dialog = None
         self.status_label.setText(f"Error during {task}: {error_msg}")
         QMessageBox.warning(self, "Error", f"An error occurred: {error_msg}")
 
     def play_with_external_player(self, video_file):
-        """Play video with system's default player"""
         try:
             if platform.system() == "Windows":
                 os.startfile(video_file)
-            elif platform.system() == "Darwin":  # macOS
+            elif platform.system() == "Darwin":
                 subprocess.call(("open", video_file))
-            else:  # Linux
-                # Try different players
+            else:
                 if shutil.which("vlc"):
                     subprocess.Popen(["vlc", video_file])
                 elif shutil.which("mpv"):
@@ -3954,54 +3826,42 @@ class VideoCompilationEditor(QMainWindow):
             return False
 
     def closeEvent(self, event):
-        """Handle window close event"""
-        # Stop any media playback
         self.media_player.stop()
-
-        # Stop processing thread if running
-        if self.processing_thread.isRunning():
+        if (
+            self.thread_active
+            and self.processing_thread
+            and self.processing_thread.isRunning()
+        ):
             self.processing_thread.abort()
             self.processing_thread.wait()
-
-        # Clean up temp files
         cleanup_temp_dirs()
-
-        # Accept the event
         event.accept()
 
     def add_videos(self):
-        """Add video files to the compilation"""
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Videos",
             "",
             "Video Files (*.mp4 *.avi *.mov *.mkv *.m4v *.webm)",
         )
-
         if not files:
             return
-
-        # Show progress dialog for large imports
-        if len(files) > 3:
-            progress = QProgressDialog(
-                "Importing videos...", "Cancel", 0, len(files), self
-            )
+        progress = (
+            QProgressDialog("Importing videos...", "Cancel", 0, len(files), self)
+            if len(files) > 3
+            else None
+        )
+        if progress:
             progress.setWindowTitle("Importing")
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
-        else:
-            progress = None
-
         failed_files = []
-
         for i, file_path in enumerate(files):
             if progress:
                 progress.setValue(i)
                 progress.setLabelText(f"Importing {os.path.basename(file_path)}...")
-                QApplication.processEvents()
                 if progress.wasCanceled():
                     break
-
             try:
                 clip = VideoClip(file_path)
                 item = QListWidgetItem(os.path.basename(file_path))
@@ -4009,220 +3869,162 @@ class VideoCompilationEditor(QMainWindow):
                 self.clip_list.addItem(item)
             except ValueError as e:
                 failed_files.append(f"{os.path.basename(file_path)}: {str(e)}")
-
+            QApplication.processEvents()
         if progress:
             progress.setValue(len(files))
-
-        # Show any errors
         if failed_files:
-            error_msg = "The following files could not be imported:\n\n" + "\n".join(
-                failed_files[:5]
+            error_msg = (
+                "Failed to import:\n"
+                + "\n".join(failed_files[:5])
+                + (
+                    f"\n...and {len(failed_files) - 5} more"
+                    if len(failed_files) > 5
+                    else ""
+                )
             )
-            if len(failed_files) > 5:
-                error_msg += f"\n\n...and {len(failed_files) - 5} more"
             QMessageBox.warning(self, "Import Errors", error_msg)
-
-        # Update status
         if len(files) > len(failed_files):
-            self.status_label.setText(f"Added {len(files) - len(failed_files)} videos")
-
-            # Select the first added item
-            if self.clip_list.count() > 0:
-                self.clip_list.setCurrentRow(0)
-
-            # Update timeline
-            self.update_timeline()
-
-            # Invalidate preview cache
-            self.preview_all_cache["signature"] = None
+            self.status_label.setText(
+                f"Historian: Added {len(files) - len(failed_files)} videos"
+            )
+            self.clip_list.setCurrentRow(0)
+        self.update_timeline()
+        self.preview_all_cache["signature"] = None
 
     def add_images(self):
-        """Add image files to the compilation"""
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Images",
             "",
             "Image Files (*.jpg *.jpeg *.png *.bmp *.gif *.webp)",
         )
-
         if not files:
             return
-
-        # Ask for duration
         dialog = ImageDurationDialog(self, self.default_image_duration)
         if not dialog.exec_():
             return
-
         duration = dialog.duration_spin.value()
         apply_to_all = dialog.apply_to_all.isChecked()
         self.default_image_duration = duration
-
-        # Show progress dialog for large imports
-        if len(files) > 3:
-            progress = QProgressDialog(
-                "Importing images...", "Cancel", 0, len(files), self
-            )
+        progress = (
+            QProgressDialog("Importing images...", "Cancel", 0, len(files), self)
+            if len(files) > 3
+            else None
+        )
+        if progress:
             progress.setWindowTitle("Importing")
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
-        else:
-            progress = None
-
         failed_files = []
-
         for i, file_path in enumerate(files):
             if progress:
                 progress.setValue(i)
                 progress.setLabelText(f"Importing {os.path.basename(file_path)}...")
-                QApplication.processEvents()
                 if progress.wasCanceled():
                     break
-
             try:
                 image = ImageItem(file_path)
                 if apply_to_all:
                     image.display_duration = duration
                     image.duration = duration
                     image.end_time = duration
-
                 item = QListWidgetItem(os.path.basename(file_path))
                 item.setData(Qt.UserRole, image)
                 self.clip_list.addItem(item)
             except ValueError as e:
                 failed_files.append(f"{os.path.basename(file_path)}: {str(e)}")
-
+            QApplication.processEvents()
         if progress:
             progress.setValue(len(files))
-
-        # Show any errors
         if failed_files:
-            error_msg = "The following files could not be imported:\n\n" + "\n".join(
-                failed_files[:5]
+            error_msg = (
+                "Failed to import:\n"
+                + "\n".join(failed_files[:5])
+                + (
+                    f"\n...and {len(failed_files) - 5} more"
+                    if len(failed_files) > 5
+                    else ""
+                )
             )
-            if len(failed_files) > 5:
-                error_msg += f"\n\n...and {len(failed_files) - 5} more"
             QMessageBox.warning(self, "Import Errors", error_msg)
-
-        # Update status
         if len(files) > len(failed_files):
             self.status_label.setText(f"Added {len(files) - len(failed_files)} images")
-
-            # Select the first added item
-            if self.clip_list.count() > 0:
-                self.clip_list.setCurrentRow(0)
-
-            # Update timeline
-            self.update_timeline()
-
-            # Invalidate preview cache
-            self.preview_all_cache["signature"] = None
+            self.clip_list.setCurrentRow(0)
+        self.update_timeline()
+        self.preview_all_cache["signature"] = None
 
     def edit_selected(self):
-        """Edit properties of the selected item"""
         if not self.current_item:
             QMessageBox.information(
                 self, "No Selection", "Please select a media item to edit."
             )
             return
-
-        # Create edit dialog
         dialog = EditDialog(self, self.current_item)
         if dialog.exec_():
-            # Apply changes and invalidate preview
             self.current_item.invalidate_preview()
             self.status_label.setText(
                 f"Updated {os.path.basename(self.current_item.file_path)}"
             )
-
-            # Update timeline since clip duration may have changed
             self.update_timeline()
-
-            # Check for pending changes
             self.check_pending_changes()
-
-            # Invalidate preview cache
             self.preview_all_cache["signature"] = None
 
     def randomize_order(self):
-        """Shuffle the order of items in the list"""
         if self.clip_list.count() <= 1:
             return
-
-        # Get all items
-        items = []
-        for i in range(self.clip_list.count()):
-            item = self.clip_list.item(i)
-            items.append((item.text(), item.data(Qt.UserRole)))
-
-        # Shuffle items
+        items = [
+            (self.clip_list.item(i).text(), self.clip_list.item(i).data(Qt.UserRole))
+            for i in range(self.clip_list.count())
+        ]
         random.shuffle(items)
-
-        # Clear and refill list
         self.clip_list.clear()
-
         for text, data in items:
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, data)
             self.clip_list.addItem(item)
-
-        self.status_label.setText("Items shuffled")
-
-        # Update timeline
+        self.status_label.setText("Historian: Items shuffled")
         self.update_timeline()
-
-        # Invalidate preview cache
         self.preview_all_cache["signature"] = None
+        toast = QMessageBox(self)
+        toast.setWindowTitle("Historian")
+        toast.setText("Clips randomized successfully.")
+        toast.setStandardButtons(QMessageBox.NoButton)
+        toast.show()
+        QTimer.singleShot(1500, toast.close)
 
     def delete_selected(self):
-        """Remove selected items from the list"""
         if not self.current_item:
             QMessageBox.information(
                 self, "No Selection", "Please select a media item to remove."
             )
             return
-
-        # Find the current item
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
             if item.data(Qt.UserRole) == self.current_item:
-                # Clean up preview if it exists
                 if self.current_item.preview_file and os.path.exists(
                     self.current_item.preview_file
                 ):
                     try:
                         os.unlink(self.current_item.preview_file)
-                    except:
-                        pass
-
-                # Remove from list
+                    except Exception as e:
+                        print(f"Error deleting preview file: {e}")
                 self.clip_list.takeItem(i)
                 self.current_item = None
                 self.status_label.setText("Item removed")
-
-                # Update timeline
                 self.update_timeline()
-
-                # Invalidate preview cache
                 self.preview_all_cache["signature"] = None
-
-                return
+                break
 
     def selection_changed(self):
-        """Handle list selection change"""
         selected_items = self.clip_list.selectedItems()
-
         if selected_items:
-            # Get the selected item
             self.current_item = selected_items[0].data(Qt.UserRole)
-
-            # Update status to show what's selected
             file_name = os.path.basename(self.current_item.file_path)
-            if self.current_item.preview_status == "ready":
-                self.status_label.setText(f"Selected: {file_name} (Preview available)")
-            else:
-                self.status_label.setText(
-                    f"Selected: {file_name} (Use Preview button to preview)"
-                )
+            self.status_label.setText(
+                f"Selected: {file_name} (Preview available)"
+                if self.current_item.preview_status == "ready"
+                else f"Selected: {file_name} (Use Preview button to preview)"
+            )
             if self.timeline:
                 index = self.clip_list.currentRow()
                 if index >= 0:
@@ -4231,265 +4033,201 @@ class VideoCompilationEditor(QMainWindow):
         else:
             self.current_item = None
             self.status_label.setText("Ready")
-
-            # Clear timeline highlight
             if self.timeline:
                 self.timeline.hover_clip_index = -1
                 self.timeline.update()
 
     def preview_selected_item(self):
-        """Preview the selected item"""
         if not self.current_item:
             QMessageBox.information(
                 self, "No Selection", "Please select a media item to preview."
             )
             return
-
-        # Check if already processing
         if self.is_processing:
             QMessageBox.information(
                 self, "Processing", "Please wait for the current operation to complete."
             )
             return
-
-        # Check if preview already exists and there are no pending changes
         if (
             not self.current_item.has_pending_changes
             and self.current_item.preview_status == "ready"
             and self.current_item.preview_file
             and os.path.exists(self.current_item.preview_file)
         ):
-            # Preview exists, just play it
             self.preview_file = self.current_item.preview_file
             self.media_player.setMedia(
-                QMediaContent(QUrl.fromLocalFile(self.current_item.preview_file))
+                QMediaContent(QUrl.fromLocalFile(self.preview_file))
             )
             self.media_player.play()
             self.status_label.setText(
-                f"Playing: {os.path.basename(self.current_item.file_path)}"
+                f"Historian: Playing: {os.path.basename(self.current_item.file_path)}"
             )
             return
-
-        # No preview exists or changes pending, need to create one
         self.is_processing = True
+        self.thread_active = True
         self.current_item.preview_status = "generating"
         self.status_label.setText(
-            f"Creating preview for {os.path.basename(self.current_item.file_path)}..."
+            f"Historian: Creating preview for {os.path.basename(self.current_item.file_path)}..."
         )
-
-        # Create progress dialog
         self.progress_dialog = QProgressDialog(
             "Creating preview...", "Cancel", 0, 100, self
         )
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
-        self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
+        self.progress_dialog.setMinimumDuration(400)
         self.progress_dialog.setValue(0)
-
-        # Set up processing thread
+        self.processing_thread = ProcessingThread(self)
+        self.processing_thread.progress.connect(self.update_progress)
+        self.processing_thread.finished.connect(self.processing_finished)
+        self.processing_thread.error.connect(self.processing_error)
         self.processing_thread.setup_task("preview_item", [self.current_item])
-
-        # Start thread
         self.processing_thread.start()
 
     def preview_all(self):
-        """Preview all items in the compilation"""
-        # Check if we have items
         if self.clip_list.count() == 0:
             QMessageBox.information(
                 self, "No Items", "Please add some media items first."
             )
             return
-
-        # Check if already processing
         if self.is_processing:
             QMessageBox.information(
                 self, "Processing", "Please wait for the current operation to complete."
             )
             return
-
-        # Get all items
-        items = []
-        for i in range(self.clip_list.count()):
-            item = self.clip_list.item(i)
-            media_item = item.data(Qt.UserRole)
-            items.append(media_item)
-
+        items = [
+            self.clip_list.item(i).data(Qt.UserRole)
+            for i in range(self.clip_list.count())
+        ]
         need_new_preview = self.check_pending_changes()
-
-        if not need_new_preview and self.preview_all_cache["path"]:
-            if os.path.exists(self.preview_all_cache["path"]):
-                # Use cached preview
-                self.preview_file = self.preview_all_cache["path"]
-                self.status_label.setText("Playing: All items (cached)")
-                self.media_player.setMedia(
-                    QMediaContent(QUrl.fromLocalFile(self.preview_file))
-                )
-                self.media_player.play()
-                return
-
-        # Update timeline display
+        if (
+            not need_new_preview
+            and self.preview_all_cache["path"]
+            and os.path.exists(self.preview_all_cache["path"])
+        ):
+            self.preview_file = self.preview_all_cache["path"]
+            self.status_label.setText("Historian: Playing: All items (cached)")
+            self.media_player.setMedia(
+                QMediaContent(QUrl.fromLocalFile(self.preview_file))
+            )
+            self.media_player.play()
+            return
         self.update_timeline()
-
-        # Start processing
         self.is_processing = True
-        self.status_label.setText("Creating full preview...")
-
-        # Create progress dialog
+        self.thread_active = True
+        self.status_label.setText("Historian: Creating full preview...")
+        if self.preview_all_btn:
+            try:
+                self.preview_all_btn.setText("Cancel Preview")
+                self.preview_all_btn.clicked.disconnect()
+                self.preview_all_btn.clicked.connect(self.cancel_processing)
+            except Exception as e:
+                print(f"Error updating preview_all_btn: {e}")
         self.progress_dialog = QProgressDialog(
             "Creating preview...", "Cancel", 0, 100, self
         )
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
-        self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
+        self.progress_dialog.setMinimumDuration(400)
         self.progress_dialog.setValue(0)
-
-        # Set up processing thread with music tracks
+        self.processing_thread = ProcessingThread(self)
+        self.processing_thread.progress.connect(self.update_progress)
+        self.processing_thread.finished.connect(self.processing_finished)
+        self.processing_thread.error.connect(self.processing_error)
         self.processing_thread.worker.music_tracks = self.music_tracks
         if self.music_tracks and len(self.music_tracks) > 0:
-            # Set legacy music file for compatibility
             self.processing_thread.worker.music_file = self.music_tracks[0].file_path
             self.processing_thread.worker.music_volume = self.music_tracks[0].volume
         else:
             self.processing_thread.worker.music_file = None
-
         self.processing_thread.setup_task("preview_all", [items])
-
-        # Start thread
         self.processing_thread.start()
 
     def export(self):
-        """Export the final compilation"""
-        # Check if we have items
         if self.clip_list.count() == 0:
             QMessageBox.information(
                 self, "No Items", "Please add some media items first."
             )
             return
-
-        # Check if already processing
         if self.is_processing:
             QMessageBox.information(
                 self, "Processing", "Please wait for the current operation to complete."
             )
             return
-
-        # Get output path
         output_path, _ = QFileDialog.getSaveFileName(
             self, "Save Compilation", "", "Video Files (*.mp4)"
         )
-
         if not output_path:
             return
-
-        # Ensure extension
         if not output_path.lower().endswith(".mp4"):
             output_path += ".mp4"
-
-        # Get all items
-        items = []
-        for i in range(self.clip_list.count()):
-            item = self.clip_list.item(i)
-            items.append(item.data(Qt.UserRole))
-
-        # Create progress dialog
+        items = [
+            self.clip_list.item(i).data(Qt.UserRole)
+            for i in range(self.clip_list.count())
+        ]
+        self.is_processing = True
+        self.thread_active = True
+        self.status_label.setText("Exporting...")
         self.progress_dialog = QProgressDialog(
             "Exporting video...", "Cancel", 0, 100, self
         )
         self.progress_dialog.setWindowTitle("Export")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
-        self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
+        self.progress_dialog.setMinimumDuration(400)
         self.progress_dialog.setValue(0)
-
-        # Start processing
-        self.is_processing = True
-        self.status_label.setText("Exporting...")
-
-        # Set up processing thread with music tracks
+        self.processing_thread = ProcessingThread(self)
+        self.processing_thread.progress.connect(self.update_progress)
+        self.processing_thread.finished.connect(self.processing_finished)
+        self.processing_thread.error.connect(self.processing_error)
         self.processing_thread.worker.music_tracks = self.music_tracks
         if self.music_tracks and len(self.music_tracks) > 0:
-            # Set legacy music file for compatibility
             self.processing_thread.worker.music_file = self.music_tracks[0].file_path
             self.processing_thread.worker.music_volume = self.music_tracks[0].volume
         else:
             self.processing_thread.worker.music_file = None
-
         self.processing_thread.setup_task("export", [items, output_path])
-
-        # Start thread
         self.processing_thread.start()
 
     def add_music(self):
-        """Add and edit background music tracks"""
-        # Calculate total video duration for the music editor
-        total_duration = 0
-        for i in range(self.clip_list.count()):
-            item = self.clip_list.item(i)
-            media_item = item.data(Qt.UserRole)
-
-            if media_item.is_image:
-                duration = media_item.display_duration
-            else:
-                duration = (
-                    media_item.end_time or media_item.duration
-                ) - media_item.start_time
-
-            total_duration += duration
-
-        # For backward compatibility, convert single music file to track if needed
+        total_duration = sum(
+            (
+                item.data(Qt.UserRole).display_duration
+                if item.data(Qt.UserRole).is_image
+                else (
+                    item.data(Qt.UserRole).end_time or item.data(Qt.UserRole).duration
+                )
+                - item.data(Qt.UserRole).start_time
+            )
+            for i in range(self.clip_list.count())
+            for item in [self.clip_list.item(i)]
+        )
         if self.music_file and not self.music_tracks:
             try:
                 track = MusicTrack(self.music_file, volume=self.music_volume)
                 self.music_tracks.append(track)
             except Exception as e:
-                print(f"Error converting music file to track: {str(e)}")
-
-        # Show dialog
+                print(f"Error converting music file to track: {e}")
         dialog = MusicEditorDialog(self, self.music_tracks, total_duration)
         if dialog.exec_():
-            # Update tracks
             old_tracks = self.music_tracks.copy()
             self.music_tracks = dialog.music_tracks
-
-            # Check if tracks changed
-            tracks_changed = len(old_tracks) != len(self.music_tracks)
-            if not tracks_changed:
-                for i, track in enumerate(self.music_tracks):
-                    if i >= len(old_tracks):
-                        tracks_changed = True
-                        break
-                    old_track = old_tracks[i]
-                    if (
-                        track.file_path != old_track.file_path
-                        or track.start_time_in_compilation
-                        != old_track.start_time_in_compilation
-                        or track.start_time_in_track != old_track.start_time_in_track
-                        or track.duration != old_track.duration
-                        or track.volume != old_track.volume
-                    ):
-                        tracks_changed = True
-                        break
-
-            # Update processing thread
+            tracks_changed = len(old_tracks) != len(self.music_tracks) or any(
+                track.file_path != old_tracks[i].file_path
+                or track.start_time_in_compilation
+                != old_tracks[i].start_time_in_compilation
+                or track.start_time_in_track != old_tracks[i].start_time_in_track
+                or track.duration != old_tracks[i].duration
+                or track.volume != old_tracks[i].volume
+                for i, track in enumerate(self.music_tracks)
+                if i < len(old_tracks)
+            )
             if self.music_tracks:
-                # Keep backward compatibility - use first track for simple cases
                 self.music_file = self.music_tracks[0].file_path
                 self.music_volume = self.music_tracks[0].volume
-                self.processing_thread.worker.music_file = self.music_file
-                self.processing_thread.worker.music_volume = self.music_volume
-
-                # Pass full tracks list
-                self.processing_thread.worker.music_tracks = self.music_tracks
             else:
-                # No tracks - clear music
                 self.music_file = None
-                self.processing_thread.worker.music_file = None
-                self.processing_thread.worker.music_tracks = []
-
-            # Clear preview cache since music has changed
             if tracks_changed:
                 self.preview_all_cache = {
                     "signature": None,
@@ -4498,44 +4236,32 @@ class VideoCompilationEditor(QMainWindow):
                 }
                 self.has_pending_music_changes = True
                 self.check_pending_changes()
-
-            # Update status with count of music tracks
-            if len(self.music_tracks) == 0:
-                self.status_label.setText("No music tracks")
-            elif len(self.music_tracks) == 1:
-                self.status_label.setText(
+            self.status_label.setText(
+                "No music tracks"
+                if not self.music_tracks
+                else (
                     f"1 music track added: {os.path.basename(self.music_tracks[0].file_path)}"
+                    if len(self.music_tracks) == 1
+                    else f"{len(self.music_tracks)} music tracks added"
                 )
-            else:
-                self.status_label.setText(
-                    f"{len(self.music_tracks)} music tracks added"
-                )
+            )
             self.timeline.set_music_tracks(self.music_tracks)
             self.timeline.update()
 
     def update_timeline(self):
-        """Update the timeline visualization with current clips"""
         if self.clip_list.count() == 0:
             self.timeline.set_clips([])
             return
-
-        # Prepare timeline data
         timeline_clips = []
         current_time = 0
-
         for i in range(self.clip_list.count()):
-            item = self.clip_list.item(i)
-            media_item = item.data(Qt.UserRole)
-
-            # Calculate duration for timeline
-            if media_item.is_image:
-                duration = media_item.display_duration
-            else:
-                duration = (
-                    media_item.end_time or media_item.duration
-                ) - media_item.start_time
-
-            # Add to timeline data
+            media_item = self.clip_list.item(i).data(Qt.UserRole)
+            duration = (
+                media_item.display_duration
+                if media_item.is_image
+                else (media_item.end_time or media_item.duration)
+                - media_item.start_time
+            )
             timeline_clips.append(
                 {
                     "name": os.path.basename(media_item.file_path),
@@ -4545,10 +4271,7 @@ class VideoCompilationEditor(QMainWindow):
                     "has_pending_changes": media_item.has_pending_changes,
                 }
             )
-
             current_time += duration
-
-        # Update timeline widget
         self.timeline.set_clips(timeline_clips)
         self.timeline.set_music_tracks(self.music_tracks)
         self.timeline.update()
