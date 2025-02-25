@@ -145,7 +145,7 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 0  # Default manual rotation (0 degrees)
+        self.manual_rotation = 90  # Default manual rotation (0 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
@@ -1011,170 +1011,259 @@ class ProcessingWorker(QObject):
 
                     # Use music tracks if available, otherwise use single music file
                     if self.music_tracks:
-                        # Create a complex filter for multiple music tracks
-                        music_filters = ""
-                        music_mix = ""
-
-                        # Build command base
-                        cmd_parts = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-i",
-                            valid_files[0],  # First input is the video
-                        ]
-
-                        # Add input for each music track
-                        track_ids = []
-                        for i, track in enumerate(self.music_tracks):
-                            if not os.path.exists(track.file_path):
-                                continue
-
-                            # Add input for this track
-                            cmd_parts.extend(["-i", track.file_path])
-                            input_idx = i + 1  # Input index in ffmpeg (0 is video)
-                            track_id = f"m{i}"
-                            track_ids.append(track_id)
-
-                            # Add volume and trim filter
-                            music_filters += f"[{input_idx}:a]volume={track.volume}"
-
-                            # Add trim if needed
-                            if track.start_time_in_track > 0 or track.duration:
-                                music_filters += (
-                                    f",atrim=start={track.start_time_in_track}"
-                                )
-                                if track.duration:
-                                    music_filters += f":duration={track.duration}"
-
-                            # Add delay if needed (for start time in compilation)
-                            if track.start_time_in_compilation > 0:
-                                music_filters += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
-
-                            # Name the output
-                            music_filters += f"[{track_id}];"
-
-                        # Combine all music tracks if there are multiple
-                        if len(track_ids) > 1:
-                            music_mix = (
-                                "".join([f"[{tid}]" for tid in track_ids])
-                                + f"amix=inputs={len(track_ids)}:duration=longest[music];"
-                            )
-                        elif len(track_ids) == 1:
-                            music_mix = (
-                                f"[{track_ids[0]}]aformat=sample_fmts=fltp[music];"
-                            )
-
-                        # Combine with original audio if we have music
-                        if music_mix:
-                            filter_complex = f"{music_filters}{music_mix}[0:a][music]amix=inputs=2:duration=first[a]"
-
-                            # Complete command
-                            cmd_parts.extend(
-                                [
-                                    "-filter_complex",
-                                    filter_complex,
-                                    "-map",
-                                    "0:v",
-                                    "-map",
-                                    "[a]",
-                                    "-c:v",
-                                    "copy",
-                                    "-c:a",
-                                    "aac",
-                                    "-b:a",
-                                    "128k",
-                                    output_file,
-                                ]
-                            )
-
-                            cmd = cmd_parts
-                        else:
-                            # No valid music tracks, just copy the file
+                        try:
+                            # Copy the file first - safer approach
                             shutil.copy(valid_files[0], output_file)
-                            if (
-                                os.path.exists(output_file)
-                                and os.path.getsize(output_file) > 1000
-                            ):
-                                self.progress.emit(100, "Preview ready (single clip)")
-                                return (output_file, total_duration)
+                            
+                            # For a single video, use a simpler approach to add music
+                            # This reduces the chance of a segfault
+                            temp_music_file = os.path.join(
+                                TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
+                            )
+                            
+                            # First, create a combined music file if multiple tracks
+                            if len(self.music_tracks) > 1:
+                                # Build command to mix music tracks
+                                music_cmd = ["ffmpeg", "-y", "-v", "error"]
+                                music_filter = ""
+                                
+                                # Add inputs
+                                valid_track_count = 0
+                                for track in self.music_tracks:
+                                    if os.path.exists(track.file_path):
+                                        music_cmd.extend(["-i", track.file_path])
+                                        valid_track_count += 1
+                                
+                                if valid_track_count == 0:
+                                    # No valid music tracks, just return video
+                                    return (output_file, total_duration)
+                                    
+                                # Create filter for mixing
+                                for i in range(valid_track_count):
+                                    music_filter += f"[{i}:a]volume={self.music_tracks[i].volume},"
+                                    
+                                    # Apply trim if needed
+                                    if (self.music_tracks[i].start_time_in_track > 0 or 
+                                        self.music_tracks[i].duration):
+                                        music_filter += f"atrim=start={self.music_tracks[i].start_time_in_track}"
+                                        if self.music_tracks[i].duration:
+                                            music_filter += f":duration={self.music_tracks[i].duration}"
+                                        music_filter += ","
+                                    
+                                    # End this input's processing
+                                    music_filter += f"aformat=sample_fmts=fltp[a{i}];"
+                                
+                                # Mix all inputs
+                                music_filter += "".join(f"[a{i}]" for i in range(valid_track_count))
+                                music_filter += f"amix=inputs={valid_track_count}:duration=longest[aout]"
+                                
+                                # Finalize command
+                                music_cmd.extend([
+                                    "-filter_complex", music_filter,
+                                    "-map", "[aout]",
+                                    "-c:a", "mp3",
+                                    "-b:a", "192k",
+                                    temp_music_file
+                                ])
+                                
+                                # Run music mix command with timeout
+                                try:
+                                    music_process = subprocess.Popen(
+                                        music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                    )
+                                    
+                                    # Wait with timeout
+                                    start_time = time.time()
+                                    while music_process.poll() is None:
+                                        if time.time() - start_time > 60:  # 60 second timeout
+                                            music_process.terminate()
+                                            print("Music mixing timed out")
+                                            break
+                                        time.sleep(0.1)
+                                    
+                                    # Check result
+                                    if (not os.path.exists(temp_music_file) or 
+                                        os.path.getsize(temp_music_file) < 1000):
+                                        print("Failed to create mixed music file")
+                                        # Return video without music
+                                        return (output_file, total_duration)
+                                except Exception as e:
+                                    print(f"Error mixing music tracks: {str(e)}")
+                                    # Return video without music
+                                    return (output_file, total_duration)
+                            else:
+                                # Just one track, use it directly
+                                if os.path.exists(self.music_tracks[0].file_path):
+                                    temp_music_file = self.music_tracks[0].file_path
+                                else:
+                                    # No valid music track
+                                    return (output_file, total_duration)
+                            
+                            # Now add the music to the video
+                            music_add_cmd = [
+                                "ffmpeg", "-y", "-v", "error",
+                                "-i", output_file,
+                                "-i", temp_music_file,
+                                "-filter_complex", "[1:a]volume=0.7[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                "-map", "0:v", "-map", "[a]",
+                                "-c:v", "copy",
+                                "-c:a", "aac", "-b:a", "128k",
+                                "-shortest"
+                            ]
+                            
+                            # Create final output file
+                            final_output = os.path.join(
+                                TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
+                            )
+                            music_add_cmd.append(final_output)
+                            
+                            # Run command with timeout
+                            try:
+                                add_process = subprocess.Popen(
+                                    music_add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                )
+                                
+                                # Wait with timeout
+                                start_time = time.time()
+                                while add_process.poll() is None:
+                                    if time.time() - start_time > 60:  # 60 second timeout
+                                        add_process.terminate()
+                                        print("Music addition timed out")
+                                        break
+                                    time.sleep(0.1)
+                                
+                                # Check result
+                                if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                                    # Success - clean up and return
+                                    os.unlink(output_file)  # Remove the non-music version
+                                    
+                                    # Clean up temp music file if we created it
+                                    if len(self.music_tracks) > 1 and temp_music_file != self.music_tracks[0].file_path:
+                                        try:
+                                            os.unlink(temp_music_file)
+                                        except:
+                                            pass
+                                    
+                                    # Clean up temp files
+                                    for file in valid_files:
+                                        try:
+                                            if os.path.exists(file):
+                                                os.unlink(file)
+                                        except:
+                                            pass
+                                    
+                                    self.progress.emit(100, "Preview ready (with music)")
+                                    return (final_output, total_duration)
+                            except Exception as e:
+                                print(f"Error adding music to video: {str(e)}")
+                        except Exception as e:
+                            print(f"Error in music processing: {str(e)}")
+                            # Fall through to use the video without music
                     else:
                         # Legacy: Add music to single file using the simple approach
-                        cmd = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-i",
-                            valid_files[0],
-                            "-i",
-                            self.music_file,
-                            "-filter_complex",
-                            f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                            "-map",
-                            "0:v",
-                            "-map",
-                            "[a]",
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "128k",
-                            output_file,
-                        ]
+                        try:
+                            # Copy file first
+                            shutil.copy(valid_files[0], output_file)
+                            
+                            # Create music command
+                            music_cmd = [
+                                "ffmpeg",
+                                "-y",
+                                "-v",
+                                "error",
+                                "-i",
+                                output_file,
+                                "-i",
+                                self.music_file,
+                                "-filter_complex",
+                                f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "[a]",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k"
+                            ]
+                            
+                            # Create final output
+                            final_output = os.path.join(
+                                TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
+                            )
+                            music_cmd.append(final_output)
+                            
+                            # Run command
+                            process = subprocess.Popen(
+                                music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                            )
+                            
+                            # Monitor with timeout
+                            start_time = time.time()
+                            while process.poll() is None:
+                                if self._abort:
+                                    process.terminate()
+                                    try:
+                                        if os.path.exists(final_output):
+                                            os.unlink(final_output)
+                                    except:
+                                        pass
+                                    return "Aborted"
+                                
+                                if time.time() - start_time > 60:
+                                    process.terminate()
+                                    break
+                                
+                                time.sleep(0.1)
+                            
+                            # Check if successful
+                            if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                                # Success - clean up and return
+                                os.unlink(output_file)  # Remove non-music version
+                                
+                                # Clean up temp files
+                                for file in valid_files:
+                                    try:
+                                        if os.path.exists(file):
+                                            os.unlink(file)
+                                    except:
+                                        pass
+                                
+                                self.progress.emit(100, "Preview ready (with music)")
+                                return (final_output, total_duration)
+                        except Exception as e:
+                            print(f"Error in legacy music processing: {str(e)}")
+                            # Fall through to use video without music
 
-                    process = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                    )
-
-                    # Monitor with timeout
-                    start_time = time.time()
-                    while process.poll() is None:
-                        if self._abort:
-                            process.terminate()
-                            try:
-                                if os.path.exists(output_file):
-                                    os.unlink(output_file)
-                            except:
-                                pass
-                            return "Aborted"
-
-                        if time.time() - start_time > 60:
-                            process.terminate()
-                            break
-
-                        time.sleep(0.1)
-
-                    # Return result with duration
-                    if (
-                        os.path.exists(output_file)
-                        and os.path.getsize(output_file) > 1000
-                    ):
-                        self.progress.emit(100, "Preview ready (with music)")
+                # If we get here, either music wasn't requested or it failed
+                # Just return the copy of the single clip
+                try:
+                    # Make sure we have a copy of the file
+                    if not os.path.exists(output_file) or os.path.getsize(output_file) < 1000:
+                        shutil.copy(valid_files[0], output_file)
+                    
+                    if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+                        self.progress.emit(100, "Preview ready (single clip)")
+                        
                         # Clean up temp files
                         for file in valid_files:
                             try:
-                                if os.path.exists(file):
+                                if os.path.exists(file) and file != output_file:
                                     os.unlink(file)
                             except:
                                 pass
-                        return (output_file, total_duration)
-
-                # If music addition failed or wasn't requested, just copy the file
-                try:
-                    shutil.copy(valid_files[0], output_file)
-                    if (
-                        os.path.exists(output_file)
-                        and os.path.getsize(output_file) > 1000
-                    ):
-                        self.progress.emit(100, "Preview ready (single clip)")
+                        
                         return (output_file, total_duration)
                 except Exception as e:
                     print(f"Error copying single file: {str(e)}")
+                    # Try to return the original file as fallback
+                    if os.path.exists(valid_files[0]):
+                        return (valid_files[0], total_duration)
+                    return "Error: Failed to create preview output"
 
-            # Concatenate all files
+            # Multiple clips - concatenate them
             self.progress.emit(80, "Combining all clips...")
 
             # Output file
@@ -1265,172 +1354,170 @@ class ProcessingWorker(QObject):
                     self.music_file and os.path.exists(self.music_file)
                 ):
                     self.progress.emit(90, "Adding background music...")
-                    output_with_music = os.path.join(
-                        TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
-                    )
-                    music_added = False
-
-                    # Use music tracks if available, otherwise fall back to legacy mode
-                    if self.music_tracks:
-                        # Create a complex filter for multiple music tracks
-                        music_filters = ""
-                        music_mix = ""
-
-                        # Build command base
-                        cmd_parts = [
-                            "ffmpeg",
-                            "-y",
-                            "-v",
-                            "error",
-                            "-i",
-                            output_file,  # First input is the video
-                        ]
-
-                        # Add input for each music track
-                        track_ids = []
-                        for i, track in enumerate(self.music_tracks):
-                            if not os.path.exists(track.file_path):
-                                continue
-
-                            # Add input for this track
-                            cmd_parts.extend(["-i", track.file_path])
-                            input_idx = i + 1  # Input index in ffmpeg (0 is video)
-                            track_id = f"m{i}"
-                            track_ids.append(track_id)
-
-                            # Add volume and trim filter
-                            music_filters += f"[{input_idx}:a]volume={track.volume}"
-
-                            # Add trim if needed
-                            if track.start_time_in_track > 0 or track.duration:
-                                music_filters += (
-                                    f",atrim=start={track.start_time_in_track}"
-                                )
-                                if track.duration:
-                                    music_filters += f":duration={track.duration}"
-
-                            # Add delay if needed (for start time in compilation)
-                            if track.start_time_in_compilation > 0:
-                                music_filters += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
-
-                            # Name the output
-                            music_filters += f"[{track_id}];"
-
-                        # Combine all music tracks if there are multiple
-                        if len(track_ids) > 1:
-                            music_mix = (
-                                "".join([f"[{tid}]" for tid in track_ids])
-                                + f"amix=inputs={len(track_ids)}:duration=longest[music];"
-                            )
-                        elif len(track_ids) == 1:
-                            music_mix = (
-                                f"[{track_ids[0]}]aformat=sample_fmts=fltp[music];"
-                            )
-
-                        # Combine with original audio if we have music
-                        if music_mix:
-                            filter_complex = f"{music_filters}{music_mix}[0:a][music]amix=inputs=2:duration=first[a]"
-
-                            # Complete command
-                            cmd_parts.extend(
-                                [
-                                    "-filter_complex",
-                                    filter_complex,
-                                    "-map",
-                                    "0:v",
-                                    "-map",
-                                    "[a]",
-                                    "-c:v",
-                                    "copy",
-                                    "-c:a",
-                                    "aac",
-                                    "-b:a",
-                                    "128k",
-                                    "-shortest",
-                                    output_with_music,
-                                ]
-                            )
-
-                            cmd = cmd_parts
-                            music_added = True
-                        else:
-                            # No valid music tracks, just copy the file
-                            try:
-                                shutil.copy(output_file, output_with_music)
-                                music_added = True
-                            except Exception as e:
-                                print(f"Error copying file for music: {str(e)}")
-                    else:
-                        # Legacy mode with single music file
-                        if self.music_file and os.path.exists(self.music_file):
-                            cmd = [
-                                "ffmpeg",
-                                "-y",
-                                "-v",
-                                "error",
-                                "-i",
-                                output_file,
-                                "-i",
-                                self.music_file,
-                                "-filter_complex",
-                                f"[1:a]volume={self.music_volume},aloop=loop=-1:size=2e+09[music];[0:a][music]amix=inputs=2:duration=first[a]",
-                                "-map",
-                                "0:v",
-                                "-map",
-                                "[a]",
-                                "-c:v",
-                                "copy",
-                                "-c:a",
-                                "aac",
-                                "-b:a",
-                                "128k",
-                                "-shortest",
-                                output_with_music,
-                            ]
-                            music_added = True
-
-                    # Run ffmpeg command if we have a valid command
-                    if music_added and "cmd" in locals():
-                        process = subprocess.Popen(
-                            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    # Use a simpler approach for adding music to avoid segfault
+                    
+                    try:
+                        # Create a combined music file if needed
+                        temp_music_file = os.path.join(
+                            TEMP_DIR, f"temp_music_{uuid.uuid4().hex[:8]}.mp3"
                         )
-
-                        # Monitor with timeout
+                        
+                        if self.music_tracks and len(self.music_tracks) > 0:
+                            # If multiple tracks, mix them first
+                            if len(self.music_tracks) > 1:
+                                # Mix all music tracks to a single file
+                                music_cmd = ["ffmpeg", "-y", "-v", "error"]
+                                music_inputs = []
+                                
+                                # Add all valid tracks
+                                valid_tracks = []
+                                for track in self.music_tracks:
+                                    if os.path.exists(track.file_path):
+                                        music_cmd.extend(["-i", track.file_path])
+                                        valid_tracks.append(track)
+                                
+                                if not valid_tracks:
+                                    # No valid music, skip music addition
+                                    self.progress.emit(100, "Preview ready (no music available)")
+                                    return (output_file, total_duration)
+                                
+                                # Create filter string
+                                filter_str = ""
+                                for i, track in enumerate(valid_tracks):
+                                    # Base volume adjustment 
+                                    filter_str += f"[{i}:a]volume={track.volume}"
+                                    
+                                    # Add trim if needed
+                                    if track.start_time_in_track > 0 or track.duration:
+                                        filter_str += f",atrim=start={track.start_time_in_track}"
+                                        if track.duration:
+                                            filter_str += f":duration={track.duration}"
+                                    
+                                    # Add delay for start_time_in_compilation
+                                    if track.start_time_in_compilation > 0:
+                                        filter_str += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
+                                    
+                                    # End this input
+                                    filter_str += f"[a{i}];"
+                                
+                                # Mix all inputs
+                                filter_str += "".join(f"[a{i}]" for i in range(len(valid_tracks)))
+                                filter_str += f"amix=inputs={len(valid_tracks)}:duration=longest[aout]"
+                                
+                                # Complete command
+                                music_cmd.extend([
+                                    "-filter_complex", filter_str,
+                                    "-map", "[aout]",
+                                    "-c:a", "mp3",
+                                    "-b:a", "192k",
+                                    temp_music_file
+                                ])
+                                
+                                # Run with timeout
+                                music_process = subprocess.Popen(
+                                    music_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                                )
+                                
+                                start_time = time.time()
+                                while music_process.poll() is None:
+                                    if time.time() - start_time > 60:
+                                        music_process.terminate()
+                                        print("Music mixing timed out")
+                                        # Skip music addition
+                                        self.progress.emit(100, "Preview ready (music mixing failed)")
+                                        return (output_file, total_duration)
+                                    time.sleep(0.1)
+                                    
+                                # Check result
+                                if not os.path.exists(temp_music_file) or os.path.getsize(temp_music_file) < 1000:
+                                    # Failed to create mixed music
+                                    self.progress.emit(100, "Preview ready (no music)")
+                                    return (output_file, total_duration)
+                            else:
+                                # Just one track, use it directly
+                                temp_music_file = self.music_tracks[0].file_path
+                        elif self.music_file and os.path.exists(self.music_file):
+                            # Use legacy music file directly
+                            temp_music_file = self.music_file
+                        else:
+                            # No valid music
+                            self.progress.emit(100, "Preview ready (no music)")
+                            return (output_file, total_duration)
+                        
+                        # Now add the music to the video
+                        final_output = os.path.join(
+                            TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
+                        )
+                        
+                        # Simple filter for adding music
+                        volume = self.music_volume
+                        if self.music_tracks and len(self.music_tracks) > 0:
+                            volume = 0.7  # Default if we mixed tracks
+                        
+                        add_cmd = [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", output_file,
+                            "-i", temp_music_file,
+                            "-filter_complex", f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map", "0:v", "-map", "[a]",
+                            "-c:v", "copy",
+                            "-c:a", "aac", "-b:a", "128k",
+                            "-shortest",
+                            final_output
+                        ]
+                        
+                        # Run with timeout
+                        add_process = subprocess.Popen(
+                            add_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                        )
+                        
                         start_time = time.time()
-                        max_processing_time = max(
-                            60, total_duration * 0.5
-                        )  # Less time needed for just adding audio
-
-                        while process.poll() is None:
+                        while add_process.poll() is None:
                             if self._abort:
-                                process.terminate()
+                                add_process.terminate()
                                 try:
-                                    if os.path.exists(output_with_music):
-                                        os.unlink(output_with_music)
+                                    if os.path.exists(final_output):
+                                        os.unlink(final_output)
                                 except:
                                     pass
                                 return "Aborted"
-
-                            if time.time() - start_time > max_processing_time:
-                                process.terminate()
+                                
+                            if time.time() - start_time > 60:
+                                add_process.terminate()
+                                print("Music addition timed out")
                                 break
-
+                                
                             time.sleep(0.1)
-
-                        # Check if music addition succeeded
-                        if (
-                            os.path.exists(output_with_music)
-                            and os.path.getsize(output_with_music) > 1000
-                        ):
+                        
+                        # Check result
+                        if os.path.exists(final_output) and os.path.getsize(final_output) > 1000:
+                            # Success! Use the music version
                             try:
-                                # Remove original without music
+                                # Remove original
                                 if os.path.exists(output_file):
                                     os.unlink(output_file)
-
-                                # Use the version with music
-                                output_file = output_with_music
+                                    
+                                # Clean up temp music file if we created it
+                                if (self.music_tracks and len(self.music_tracks) > 1 and 
+                                    temp_music_file != self.music_file):
+                                    try:
+                                        os.unlink(temp_music_file)
+                                    except:
+                                        pass
+                                    
+                                # Use the music version
+                                output_file = final_output
                             except Exception as e:
-                                print(f"Error replacing output file: {str(e)}")
+                                print(f"Error finalizing music version: {e}")
+                                # If we can't clean up, just use what we have
+                                if os.path.exists(final_output):
+                                    output_file = final_output
+                        else:
+                            # Music addition failed, but we still have the original
+                            print("Failed to add music, using version without music")
+                    except Exception as e:
+                        print(f"Error in music processing: {e}")
+                        # Continue with no music
 
             # Check if concat succeeded
             if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
@@ -1440,7 +1527,7 @@ class ProcessingWorker(QObject):
                 # Clean up individual files
                 for file in valid_files:
                     try:
-                        if os.path.exists(file):
+                        if os.path.exists(file) and file != output_file:
                             os.unlink(file)
                     except:
                         pass
@@ -1456,6 +1543,9 @@ class ProcessingWorker(QObject):
                     return (fallback_file, total_duration)
                 except Exception as e:
                     print(f"Final fallback failed: {str(e)}")
+                    # Return one of the original files if possible
+                    if valid_files and os.path.exists(valid_files[0]):
+                        return (valid_files[0], total_duration)
                     return "Error: Failed to create combined preview"
 
         except Exception as e:
@@ -2274,7 +2364,7 @@ class TimelineWidget(QWidget):
             # Draw clip
             is_image = clip.get("is_image", False)
             has_changes = clip.get("has_pending_changes", False)
-            clip_rect = QRect(x, 5, clip_width, main_clip_height - 10)
+            clip_rect = QRect(x, 5, clip_width, int(main_clip_height - 10))
 
             # Clip background
             if is_image:
@@ -2306,7 +2396,7 @@ class TimelineWidget(QWidget):
 
             # Draw clip name (truncated if needed)
             clip_name = clip.get("name", "")
-            name_rect = QRect(x + 5, main_clip_height // 2 - 10, clip_width - 10, 20)
+            name_rect = QRect(x + 5, int(main_clip_height) // 2 - 10, clip_width - 10, 20)
             font = painter.font()
             font.setBold(True)
             painter.setFont(font)
@@ -2318,7 +2408,7 @@ class TimelineWidget(QWidget):
             # Draw duration
             duration_text = self.format_time(clip_duration)
             painter.setPen(QColor(255, 255, 255))
-            painter.drawText(x + 5, main_clip_height - 10, duration_text)
+            painter.drawText(x + 5, int(main_clip_height - 10), duration_text)
 
             # Draw hover information if this clip is being hovered
             if is_hover and clip_width > 20:
@@ -2332,13 +2422,15 @@ class TimelineWidget(QWidget):
                     # Draw time indicator
                     painter.setPen(QPen(QColor(255, 165, 0), 2))  # Orange line
                     hover_x_pos = int(x + hover_pos)
-                    painter.drawLine(hover_x_pos, 5, hover_x_pos, main_clip_height - 5)
+                    painter.drawLine(hover_x_pos, 5, hover_x_pos, int(main_clip_height - 5))
+
 
                     # Draw time label
                     time_label = f"{self.format_time(absolute_time)}"
-                    painter.fillRect(hover_x_pos - 40, main_clip_height - 30, 80, 20, QColor(0, 0, 0, 180))
+                    painter.fillRect(hover_x_pos - 40, int(main_clip_height - 30), 80, 20, QColor(0, 0, 0, 180))
                     painter.setPen(QColor(255, 165, 0))
-                    painter.drawText(hover_x_pos - 40, main_clip_height - 30, 80, 20, Qt.AlignCenter, time_label)
+                    painter.drawText(hover_x_pos - 40, int(main_clip_height - 30), 80, 20, Qt.AlignCenter, time_label)
+
 
             x += clip_width
 
@@ -2348,11 +2440,11 @@ class TimelineWidget(QWidget):
             y_offset = main_clip_height + 5
             
             # Draw music track background
-            painter.fillRect(0, y_offset, width, music_height, QColor(40, 40, 40))
+            painter.fillRect(0, int(y_offset), int(width), int(music_height), QColor(40, 40, 40))
             
             # Draw track separator
             painter.setPen(QPen(QColor(60, 60, 60), 1))
-            painter.drawLine(0, y_offset, width, y_offset)
+            painter.drawLine(0, int(y_offset), int(width), int(y_offset))
             
             # Draw each track
             for i, track in enumerate(self.music_tracks):
@@ -2381,8 +2473,8 @@ class TimelineWidget(QWidget):
                         track_name = os.path.basename(track.file_path)
                         name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_rect.width() - 10)
                         painter.drawText(
-                            track_rect.x() + 5, 
-                            track_rect.y() + track_height / 2 + 5, 
+                            int(track_rect.x() + 4), 
+                            int(track_rect.y() + track_height / 2 + 5), 
                             name
                         )
 
@@ -2860,21 +2952,24 @@ class MusicEditorDialog(QDialog):
         track_height = min(height / max(1, len(self.music_tracks)), 25)
         
         for i, track in enumerate(self.music_tracks):
-            y = i * track_height + 20  # Start below time markers
+            y = int(i * track_height + 20)  # Start below time markers, convert to int
             
             # Calculate track position
             start_x = int((track.start_time_in_compilation / self.total_video_duration) * width)
+            
             # Calculate duration - either specified or remainder of track
             if track.duration:
                 duration = track.duration
             else:
                 duration = track.total_duration - track.start_time_in_track
+                
+            # Limit by video length
             end_x = int(((track.start_time_in_compilation + duration) / self.total_video_duration) * width)
             end_x = min(end_x, width)
             
             # Draw track block
             track_width = max(2, end_x - start_x)
-            track_rect = QRect(start_x, y, track_width, track_height - 2)
+            track_rect = QRect(start_x, y, track_width, int(track_height - 2))
             
             # Color based on volume
             color_intensity = int(155 + track.volume * 100)
@@ -2890,7 +2985,9 @@ class MusicEditorDialog(QDialog):
             if track_width > 60:
                 track_name = os.path.basename(track.file_path)
                 name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_width - 10)
-                painter.drawText(track_rect.x() + 5, track_rect.y() + track_height / 2 + 5, name)
+                # Fix: Convert float to int for y coordinate
+                text_y = int(track_rect.y() + track_height / 2 + 5)
+                painter.drawText(track_rect.x() + 5, text_y, name)
 
     def populate_table(self):
         """Populate the table with music tracks"""
@@ -3505,10 +3602,10 @@ class VideoCompilationEditor(QMainWindow):
             try:
                 self.progress_dialog.setValue(value)
                 self.progress_dialog.setLabelText(message)
-            except:
+            except Exception as e:
                 # Handle case where dialog might be closed during update
+                print(f"Progress update error: {e}")
                 pass
-
 
     def check_pending_changes(self):
         """Check for pending changes and update UI indicators"""
