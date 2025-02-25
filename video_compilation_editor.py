@@ -9,14 +9,51 @@ import uuid
 import json
 import math
 import subprocess
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QListWidget, QListWidgetItem, QSlider, QLabel, QFileDialog, QMessageBox, 
-                             QAbstractItemView, QProgressDialog, QDialog, QSpinBox, QCheckBox, QSplitter,
-                             QToolButton, QSizePolicy, QStyle, QFrame, QTabWidget)
+from PyQt5.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QListWidget,
+    QListWidgetItem,
+    QSlider,
+    QLabel,
+    QFileDialog,
+    QMessageBox,
+    QAbstractItemView,
+    QProgressDialog,
+    QDialog,
+    QSpinBox,
+    QCheckBox,
+    QSplitter,
+    QToolButton,
+    QSizePolicy,
+    QStyle,
+    QFrame,
+    QTabWidget,
+    QInputDialog,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QDoubleSpinBox,
+    QComboBox,
+)
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent, QMediaPlaylist
 from PyQt5.QtMultimediaWidgets import QVideoWidget
-from PyQt5.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize, QObject, QMetaObject, Q_ARG
-from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
+from PyQt5.QtCore import (
+    Qt,
+    QUrl,
+    QThread,
+    pyqtSignal,
+    QSize,
+    QObject,
+    QMetaObject,
+    Q_ARG,
+    QRect,
+)
+from PyQt5.QtGui import QIcon, QFont, QPalette, QColor, QPainter, QPen
 
 # Create dedicated temp directory
 TEMP_DIR = os.path.join(tempfile.gettempdir(), "video_editor_temp")
@@ -25,6 +62,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Create preview directory
 PREVIEW_DIR = os.path.join(TEMP_DIR, "previews")
 os.makedirs(PREVIEW_DIR, exist_ok=True)
+
 
 def clean_directory(directory):
     """Clean a directory with error handling"""
@@ -41,44 +79,50 @@ def clean_directory(directory):
     except Exception as e:
         print(f"Warning: Error cleaning directory {directory}: {e}")
 
+
 def check_hw_encoders():
     """Check for available hardware encoders"""
     encoders = []
-    
+
     # Check for NVIDIA encoder
     try:
         nvidia = subprocess.run(
-            ['ffmpeg', '-hide_banner', '-encoders'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        if 'h264_nvenc' in nvidia.stdout:
-            encoders.append('h264_nvenc')
+        if "h264_nvenc" in nvidia.stdout:
+            encoders.append("h264_nvenc")
     except:
         pass
-        
+
     # Check for VA-API (Intel/AMD on Linux)
     try:
-        if os.path.exists('/dev/dri'):
-            encoders.append('h264_vaapi')
+        if os.path.exists("/dev/dri"):
+            encoders.append("h264_vaapi")
     except:
         pass
-    
+
     # Check for QuickSync (Intel)
     try:
         qsv = subprocess.run(
-            ['ffmpeg', '-hide_banner', '-encoders'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        if 'h264_qsv' in qsv.stdout:
-            encoders.append('h264_qsv')
+        if "h264_qsv" in qsv.stdout:
+            encoders.append("h264_qsv")
     except:
         pass
-        
+
     # If no HW encoders found, use libx264 (CPU)
     if not encoders:
-        encoders.append('libx264')
-        
+        encoders.append("libx264")
+
     return encoders
+
 
 def cleanup_temp_dirs():
     """Clean up all temp directories"""
@@ -89,8 +133,10 @@ def cleanup_temp_dirs():
     except Exception as e:
         print(f"Warning: Error during cleanup: {e}")
 
+
 class MediaItem:
     """Base class for video and image items"""
+
     def __init__(self, file_path, is_image=False):
         self.file_path = file_path
         self.is_image = is_image
@@ -99,20 +145,39 @@ class MediaItem:
         self.end_time = None
         self.duration = None
         self.rotation = 0
-        self.manual_rotation = 90  # Default manual rotation for videos (90 degrees)
+        self.manual_rotation = 0  # Default manual rotation (0 degrees)
         self.preview_file = None  # Path to cached preview
         self.preview_status = "none"  # none, generating, ready, error
         self.item_id = str(uuid.uuid4())[:8]  # Unique ID for this item
+        self.effects = []  # List of VideoEffect objects applied to this item
+        self.playback_speed = 1.0  # Default playback speed
+        self.has_pending_changes = False  # Indicator for unsaved changes
 
     def get_preview_filename(self):
         """Generate a unique filename for preview"""
         name = os.path.basename(self.file_path)
         base, _ = os.path.splitext(name)
         base = base.replace(" ", "_")
+
+        # Include effects in the filename to ensure unique cache
+        effects_hash = ""
+        if self.effects:
+            effects_str = "_".join(e.effect_type for e in self.effects)
+            effects_hash = f"_fx{hash(effects_str) % 10000}"
+
+        # Include speed in filename for cache uniqueness
+        speed_str = f"_sp{int(self.playback_speed*100)}"
+
         if self.is_image:
-            return os.path.join(PREVIEW_DIR, f"{base}_{self.item_id}_d{self.display_duration}_r{self.manual_rotation}.mp4")
+            return os.path.join(
+                PREVIEW_DIR,
+                f"{base}_{self.item_id}_d{self.display_duration}_r{self.manual_rotation}{effects_hash}.mp4",
+            )
         else:
-            return os.path.join(PREVIEW_DIR, f"{base}_{self.item_id}_s{self.start_time}_e{self.end_time or self.duration}_r{self.manual_rotation}.mp4")
+            return os.path.join(
+                PREVIEW_DIR,
+                f"{base}_{self.item_id}_s{self.start_time}_e{self.end_time or self.duration}_r{self.manual_rotation}{effects_hash}{speed_str}.mp4",
+            )
 
     def invalidate_preview(self):
         """Mark the preview as invalid"""
@@ -123,6 +188,28 @@ class MediaItem:
                 print(f"Warning: Error deleting preview file: {e}")
         self.preview_file = None
         self.preview_status = "none"
+        self.has_pending_changes = True
+
+    def get_effects_filter_string(self):
+        """Get the combined filter string for all effects"""
+        filters = []
+        for effect in self.effects:
+            effect_filter = effect.get_ffmpeg_filter()
+            if effect_filter:
+                filters.append(effect_filter)
+
+        # Add speed adjustment if not 1.0
+        if self.playback_speed != 1.0 and not any(
+            e.effect_type == "speed" for e in self.effects
+        ):
+            # Create a speed effect
+            speed_effect = VideoEffect("speed", {"factor": self.playback_speed})
+            filters.append(speed_effect.get_ffmpeg_filter())
+
+        if filters:
+            return ",".join(filters)
+        return ""
+
 
 class VideoClip(MediaItem):
     def __init__(self, file_path):
@@ -132,45 +219,47 @@ class VideoClip(MediaItem):
         self.width = 0
         self.height = 0
         self.pixel_format = "yuv420p"
-        
+
         try:
             # Use subprocess for stability with ffprobe
             cmd = [
-                'ffprobe', 
-                '-v', 'error', 
-                '-print_format', 'json', 
-                '-show_format', 
-                '-show_streams', 
-                file_path
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                file_path,
             ]
-            
+
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise ValueError(f"ffprobe failed: {result.stderr}")
-                
+
             probe = json.loads(result.stdout)
-            
-            self.duration = float(probe['format']['duration'])
+
+            self.duration = float(probe["format"]["duration"])
             self.end_time = self.duration
-            
-            for stream in probe['streams']:
-                if stream['codec_type'] == 'video':
-                    self.codec = stream.get('codec_name', 'unknown')
-                    self.bit_depth = int(stream.get('bits_per_raw_sample', 8))
-                    self.width = int(stream.get('width', 0))
-                    self.height = int(stream.get('height', 0))
-                    self.pixel_format = stream.get('pix_fmt', 'yuv420p')
-                    
+
+            for stream in probe["streams"]:
+                if stream["codec_type"] == "video":
+                    self.codec = stream.get("codec_name", "unknown")
+                    self.bit_depth = int(stream.get("bits_per_raw_sample", 8))
+                    self.width = int(stream.get("width", 0))
+                    self.height = int(stream.get("height", 0))
+                    self.pixel_format = stream.get("pix_fmt", "yuv420p")
+
                     # Handle rotation metadata
-                    if 'tags' in stream and 'rotate' in stream['tags']:
-                        self.rotation = int(stream['tags']['rotate'])
-                    
+                    if "tags" in stream and "rotate" in stream["tags"]:
+                        self.rotation = int(stream["tags"]["rotate"])
+
                     # Check for side data rotation
-                    if 'side_data_list' in stream:
-                        for side_data in stream['side_data_list']:
-                            if side_data.get('side_data_type') == 'Display Matrix':
+                    if "side_data_list" in stream:
+                        for side_data in stream["side_data_list"]:
+                            if side_data.get("side_data_type") == "Display Matrix":
                                 # Parse rotation from display matrix
-                                rotation_data = side_data.get('rotation', '')
+                                rotation_data = side_data.get("rotation", "")
                                 if rotation_data:
                                     try:
                                         # Handle both string and numeric rotation values
@@ -178,110 +267,119 @@ class VideoClip(MediaItem):
                                             rotation_val = float(rotation_data)
                                         else:
                                             # Assume it's a string like "-90.00 degrees"
-                                            rotation_val = float(rotation_data.split()[0])
-                                            
+                                            rotation_val = float(
+                                                rotation_data.split()[0]
+                                            )
+
                                         if rotation_val < 0:
                                             rotation_val = 360 + rotation_val
                                         self.rotation = int(rotation_val)
                                     except (ValueError, IndexError):
                                         pass
                     break
-                    
+
         except Exception as e:
             raise ValueError(f"Failed to probe {file_path}: {str(e)}")
+
 
 class ImageItem(MediaItem):
     def __init__(self, file_path):
         super().__init__(file_path, is_image=True)
         self.width = 0
         self.height = 0
-        
+
         try:
             # Use subprocess for stability with ffprobe
             cmd = [
-                'ffprobe', 
-                '-v', 'error', 
-                '-print_format', 'json', 
-                '-show_format', 
-                '-show_streams', 
-                file_path
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                file_path,
             ]
-            
+
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise ValueError(f"ffprobe failed: {result.stderr}")
-                
+
             probe = json.loads(result.stdout)
-            
-            for stream in probe['streams']:
-                if stream['codec_type'] == 'video':
-                    self.width = int(stream.get('width', 0))
-                    self.height = int(stream.get('height', 0))
+
+            for stream in probe["streams"]:
+                if stream["codec_type"] == "video":
+                    self.width = int(stream.get("width", 0))
+                    self.height = int(stream.get("height", 0))
                     break
-                    
+
             # For images, duration is the display duration
             self.duration = self.display_duration
             self.end_time = self.display_duration
-            
+
         except Exception as e:
             raise ValueError(f"Failed to probe image {file_path}: {str(e)}")
 
+
 class ImageDurationDialog(QDialog):
     """Dialog to set image display duration"""
+
     def __init__(self, parent=None, current_duration=5.0):
         super().__init__(parent)
         self.setWindowTitle("Image Duration")
         self.setFixedWidth(300)
-        
+
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
-        
+
         info_label = QLabel("How long should images be displayed?")
         info_label.setFont(QFont("Arial", 10, QFont.Bold))
         layout.addWidget(info_label)
-        
+
         self.duration_spin = QSpinBox(self)
         self.duration_spin.setRange(1, 60)
         self.duration_spin.setValue(int(current_duration))
         self.duration_spin.setSuffix(" seconds")
         self.duration_spin.setFixedHeight(30)
         layout.addWidget(self.duration_spin)
-        
+
         self.apply_to_all = QCheckBox("Apply to all images", self)
         self.apply_to_all.setChecked(True)
         layout.addWidget(self.apply_to_all)
-        
+
         buttons_layout = QHBoxLayout()
         self.ok_button = QPushButton("OK", self)
         self.ok_button.setFixedHeight(30)
         self.ok_button.clicked.connect(self.accept)
-        
+
         self.cancel_button = QPushButton("Cancel", self)
         self.cancel_button.setFixedHeight(30)
         self.cancel_button.clicked.connect(self.reject)
-        
+
         buttons_layout.addWidget(self.cancel_button)
         buttons_layout.addWidget(self.ok_button)
         layout.addLayout(buttons_layout)
 
+
 class EditDialog(QDialog):
     """Dialog for editing media properties"""
+
     def __init__(self, parent=None, media_item=None):
         super().__init__(parent)
         self.media_item = media_item
         self.setWindowTitle("Edit Media Properties")
         self.setMinimumWidth(450)
-        
+
         layout = QVBoxLayout(self)
-        
+
         # Create tabs for different edit options
         tab_widget = QTabWidget()
-        
+
         # Trim tab for videos
         if not media_item.is_image:
             trim_tab = QWidget()
             trim_layout = QVBoxLayout(trim_tab)
-            
+
             # Start time
             start_layout = QHBoxLayout()
             self.start_label = QLabel(f"Start: {media_item.start_time:.2f} sec")
@@ -292,161 +390,229 @@ class EditDialog(QDialog):
             start_layout.addWidget(self.start_label)
             start_layout.addWidget(self.start_slider, 1)
             trim_layout.addLayout(start_layout)
-            
+
             # End time
             end_layout = QHBoxLayout()
-            self.end_label = QLabel(f"End: {media_item.end_time if media_item.end_time else media_item.duration:.2f} sec")
+            self.end_label = QLabel(
+                f"End: {media_item.end_time if media_item.end_time else media_item.duration:.2f} sec"
+            )
             self.end_slider = QSlider(Qt.Horizontal)
             self.end_slider.setRange(0, int(media_item.duration * 1000))
-            self.end_slider.setValue(int((media_item.end_time or media_item.duration) * 1000))
+            self.end_slider.setValue(
+                int((media_item.end_time or media_item.duration) * 1000)
+            )
             self.end_slider.valueChanged.connect(self.update_end_time)
             end_layout.addWidget(self.end_label)
             end_layout.addWidget(self.end_slider, 1)
             trim_layout.addLayout(end_layout)
-            
+
             tab_widget.addTab(trim_tab, "Trim")
-        
+
         # Duration tab for images
         if media_item.is_image:
             duration_tab = QWidget()
             duration_layout = QVBoxLayout(duration_tab)
-            
+
             duration_layout.addWidget(QLabel("Duration:"))
             self.duration_slider = QSlider(Qt.Horizontal)
             self.duration_slider.setRange(1, 30)
             self.duration_slider.setValue(int(media_item.display_duration))
             self.duration_label = QLabel(f"{media_item.display_duration:.1f} seconds")
             self.duration_slider.valueChanged.connect(self.update_duration)
-            
+
             duration_layout.addWidget(self.duration_slider)
             duration_layout.addWidget(self.duration_label)
-            
+
             tab_widget.addTab(duration_tab, "Duration")
-        
+
         # Rotation tab for all media
         rotation_tab = QWidget()
         rotation_layout = QVBoxLayout(rotation_tab)
-        
+
         rotation_layout.addWidget(QLabel("Rotate:"))
         self.rotation_buttons = QHBoxLayout()
-        
+
         self.rotation_0_btn = QPushButton("0°")
         self.rotation_90_btn = QPushButton("90°")
         self.rotation_180_btn = QPushButton("180°")
         self.rotation_270_btn = QPushButton("270°")
-        
+
         self.rotation_0_btn.clicked.connect(lambda: self.set_rotation(0))
         self.rotation_90_btn.clicked.connect(lambda: self.set_rotation(90))
         self.rotation_180_btn.clicked.connect(lambda: self.set_rotation(180))
         self.rotation_270_btn.clicked.connect(lambda: self.set_rotation(270))
-        
+
         self.rotation_buttons.addWidget(self.rotation_0_btn)
         self.rotation_buttons.addWidget(self.rotation_90_btn)
         self.rotation_buttons.addWidget(self.rotation_180_btn)
         self.rotation_buttons.addWidget(self.rotation_270_btn)
-        
+
         rotation_layout.addLayout(self.rotation_buttons)
         rotation_layout.addStretch()
-        
+
         tab_widget.addTab(rotation_tab, "Rotation")
-        
+
+        # Effects tab
+        effects_tab = QWidget()
+        effects_layout = QVBoxLayout(effects_tab)
+
+        effects_layout.addWidget(QLabel("Special Effects:"))
+        effects_button = QPushButton("Edit Effects")
+        effects_button.clicked.connect(self.edit_effects)
+
+        # Display current speed if not default
+        speed_text = ""
+        if hasattr(media_item, "playback_speed") and media_item.playback_speed != 1.0:
+            speed_text = f" - Speed: {media_item.playback_speed:.2f}x"
+
+        # Display filter count if any
+        filter_count = sum(
+            1 for e in getattr(media_item, "effects", []) if e.effect_type == "filter"
+        )
+        filters_text = f" - Filters: {filter_count}" if filter_count > 0 else ""
+
+        # Status label
+        self.effects_status = QLabel(f"Current effects{speed_text}{filters_text}")
+
+        effects_layout.addWidget(effects_button)
+        effects_layout.addWidget(self.effects_status)
+        effects_layout.addStretch()
+
+        tab_widget.addTab(effects_tab, "Effects")
+
         # Highlight current rotation
         self.highlight_rotation(media_item.manual_rotation)
-        
+
         layout.addWidget(tab_widget)
-        
+
         # Buttons
         buttons = QHBoxLayout()
         ok_button = QPushButton("OK")
         ok_button.clicked.connect(self.accept)
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
-        
+
         buttons.addWidget(cancel_button)
         buttons.addWidget(ok_button)
         layout.addLayout(buttons)
-    
+
     def update_start_time(self, value):
         """Update start time slider"""
         start_time = value / 1000.0
         end_time = self.media_item.end_time or self.media_item.duration
-        
+
         # Make sure start time is valid
         if start_time >= end_time:
             start_time = end_time - 0.1
             self.start_slider.setValue(int(start_time * 1000))
-        
+
         self.media_item.start_time = start_time
         self.start_label.setText(f"Start: {start_time:.2f} sec")
-    
+
     def update_end_time(self, value):
         """Update end time slider"""
         end_time = value / 1000.0
-        
+
         # Make sure end time is valid
         if end_time <= self.media_item.start_time:
             end_time = self.media_item.start_time + 0.1
             self.end_slider.setValue(int(end_time * 1000))
-        
+
         self.media_item.end_time = end_time
         self.end_label.setText(f"End: {end_time:.2f} sec")
-    
+
     def update_duration(self, value):
         """Update image duration"""
         self.media_item.display_duration = value
         self.media_item.duration = value
         self.media_item.end_time = value
         self.duration_label.setText(f"{value:.1f} seconds")
-    
+
     def set_rotation(self, degrees):
         """Set rotation value"""
         self.media_item.manual_rotation = degrees
         self.highlight_rotation(degrees)
-    
+
     def highlight_rotation(self, degrees):
         """Highlight the selected rotation button"""
-        buttons = [self.rotation_0_btn, self.rotation_90_btn, self.rotation_180_btn, self.rotation_270_btn]
-        
+        buttons = [
+            self.rotation_0_btn,
+            self.rotation_90_btn,
+            self.rotation_180_btn,
+            self.rotation_270_btn,
+        ]
+
         for btn in buttons:
             btn.setStyleSheet("")
-        
+
         if degrees == 0:
-            self.rotation_0_btn.setStyleSheet("background-color: #1abc9c; color: white;")
+            self.rotation_0_btn.setStyleSheet(
+                "background-color: #1abc9c; color: white;"
+            )
         elif degrees == 90:
-            self.rotation_90_btn.setStyleSheet("background-color: #1abc9c; color: white;")
+            self.rotation_90_btn.setStyleSheet(
+                "background-color: #1abc9c; color: white;"
+            )
         elif degrees == 180:
-            self.rotation_180_btn.setStyleSheet("background-color: #1abc9c; color: white;")
+            self.rotation_180_btn.setStyleSheet(
+                "background-color: #1abc9c; color: white;"
+            )
         elif degrees == 270:
-            self.rotation_270_btn.setStyleSheet("background-color: #1abc9c; color: white;")
+            self.rotation_270_btn.setStyleSheet(
+                "background-color: #1abc9c; color: white;"
+            )
+
+    def edit_effects(self):
+        """Open the effects dialog"""
+        dialog = EffectsDialog(self, self.media_item)
+        if dialog.exec_():
+            # Update effects status label
+            speed_text = ""
+            if self.media_item.playback_speed != 1.0:
+                speed_text = f" - Speed: {self.media_item.playback_speed:.2f}x"
+
+            # Count filters
+            filter_count = sum(
+                1 for e in self.media_item.effects if e.effect_type == "filter"
+            )
+            filters_text = f" - Filters: {filter_count}" if filter_count > 0 else ""
+
+            self.effects_status.setText(f"Current effects{speed_text}{filters_text}")
+
 
 class ProcessingWorker(QObject):
     """Worker object for video processing"""
+
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(str, object)  # task, result
     error = pyqtSignal(str, str)  # task, error message
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._abort = False
-    
+        self.music_file = None
+        self.music_volume = 0.7  # Default 70% volume
+        self.music_tracks = []  # List of MusicTrack objects
+
     def abort(self):
         """Signal the worker to abort processing"""
         self._abort = True
-    
+
     def create_preview(self, media_item):
         """Create a preview for a single item"""
         try:
             # Check if we should abort
             if self._abort:
                 return "Aborted"
-                
+
             # Get or create preview filename
             preview_file = media_item.get_preview_filename()
-            
+
             # If preview already exists, return it
             if media_item.preview_file and os.path.exists(media_item.preview_file):
                 if os.path.getsize(media_item.preview_file) > 1000:  # Size sanity check
                     media_item.preview_status = "ready"
+                    media_item.has_pending_changes = False
                     return media_item.preview_file
                 else:
                     # Invalid preview, recreate it
@@ -456,128 +622,187 @@ class ProcessingWorker(QObject):
                         pass
                     media_item.preview_file = None
                     media_item.preview_status = "none"
-            
+
             # Create preview directory if needed
             os.makedirs(os.path.dirname(preview_file), exist_ok=True)
-            
-            self.progress.emit(10, f"Processing {os.path.basename(media_item.file_path)}...")
-            
+
+            self.progress.emit(
+                10, f"Processing {os.path.basename(media_item.file_path)}..."
+            )
+
+            # Get effects filters if any
+            effects_filter = media_item.get_effects_filter_string()
+
             if media_item.is_image:
-                # Process image preview - low resolution for speed
-                cmd = [
-                    '-y',
-                    '-loop', '1',
-                    '-i', media_item.file_path,
-                    '-t', str(media_item.display_duration),
-                    '-vf', f'scale=480:-2',
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-crf', '30',
-                    '-pix_fmt', 'yuv420p',
-                    preview_file
-                ]
-                
+                # Build filter string for image
+                vf = "scale=480:-2"
+
                 # Add rotation if needed
                 if media_item.manual_rotation != 0:
-                    cmd[5] = f'rotate={media_item.manual_rotation*math.pi/180},scale=480:-2'
-            else:
-                # Process video preview - optimize for speed
+                    rotation = f"rotate={media_item.manual_rotation*math.pi/180}"
+                    vf = f"{rotation},{vf}"
+
+                # Add effects if any
+                if effects_filter:
+                    vf = f"{effects_filter},{vf}"
+
+                # Process image preview - low resolution for speed
                 cmd = [
-                    '-y',
-                    '-i', media_item.file_path,
-                    '-ss', str(media_item.start_time),
-                    '-t', str((media_item.end_time or media_item.duration) - media_item.start_time),
-                    '-vf', 'scale=480:-2',
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-crf', '30',
-                    '-c:a', 'aac',
-                    '-b:a', '64k',
-                    '-pix_fmt', 'yuv420p',
-                    preview_file
+                    "ffmpeg",
+                    "-y",
+                    "-loop",
+                    "1",
+                    "-i",
+                    media_item.file_path,
+                    "-t",
+                    str(media_item.display_duration),
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "30",
+                    "-pix_fmt",
+                    "yuv420p",
+                    preview_file,
                 ]
-                
+            else:
+                # Build filter string for video
+                vf = "scale=480:-2,fps=24"
+
                 # Add rotation if needed
-                total_rotation = (media_item.rotation + media_item.manual_rotation) % 360
+                total_rotation = (
+                    media_item.rotation + media_item.manual_rotation
+                ) % 360
                 if total_rotation != 0:
                     if total_rotation == 90:
-                        cmd[5] = 'transpose=1,scale=480:-2'
+                        rotation_filter = "transpose=1"
                     elif total_rotation == 180:
-                        cmd[5] = 'transpose=2,transpose=2,scale=480:-2'
+                        rotation_filter = "transpose=2,transpose=2"
                     elif total_rotation == 270:
-                        cmd[5] = 'transpose=2,scale=480:-2'
-            
+                        rotation_filter = "transpose=2"
+                    vf = f"{rotation_filter},{vf}"
+
+                # Add effects if any
+                if effects_filter:
+                    vf = f"{effects_filter},{vf}"
+
+                # Process video preview - optimize for speed
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    media_item.file_path,
+                    "-ss",
+                    str(media_item.start_time),
+                    "-t",
+                    str(
+                        (media_item.end_time or media_item.duration)
+                        - media_item.start_time
+                    ),
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "30",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "64k",
+                    "-pix_fmt",
+                    "yuv420p",
+                    preview_file,
+                ]
+
             # Run ffmpeg process
             process = subprocess.Popen(
-                ['ffmpeg'] + cmd,
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
-                bufsize=1
+                bufsize=1,
             )
-            
+
             # Process output line by line for progress tracking
-            for line in iter(process.stdout.readline, ''):
+            for line in iter(process.stdout.readline, ""):
                 if self._abort:
                     process.terminate()
                     media_item.preview_status = "none"
                     return "Aborted"
-                    
+
                 if "time=" in line:
                     # Try to extract time information
                     try:
                         time_parts = line.split("time=")[1].split()[0].split(":")
                         if len(time_parts) == 3:
                             hours, minutes, seconds = time_parts
-                            current_sec = float(hours) * 3600 + float(minutes) * 60 + float(seconds.replace(',', '.'))
-                            total_sec = (media_item.end_time or media_item.duration) - media_item.start_time
+                            current_sec = (
+                                float(hours) * 3600
+                                + float(minutes) * 60
+                                + float(seconds.replace(",", "."))
+                            )
+                            total_sec = (
+                                media_item.end_time or media_item.duration
+                            ) - media_item.start_time
                             if media_item.is_image:
                                 total_sec = media_item.display_duration
                             if total_sec > 0:
-                                progress = min(int((current_sec / total_sec) * 80) + 10, 90)
-                                self.progress.emit(progress, f"Processing {os.path.basename(media_item.file_path)}...")
+                                progress = min(
+                                    int((current_sec / total_sec) * 80) + 10, 90
+                                )
+                                self.progress.emit(
+                                    progress,
+                                    f"Processing {os.path.basename(media_item.file_path)}...",
+                                )
                     except:
                         pass
-            
+
             # Wait for process to complete
             process.wait()
-            
+
             if process.returncode != 0:
                 self.progress.emit(0, "Error processing file")
                 media_item.preview_status = "error"
                 return f"Error: ffmpeg process failed with code {process.returncode}"
-            
+
             self.progress.emit(100, "Preview ready")
-                
+
             # Check if output file exists and is valid
             if os.path.exists(preview_file) and os.path.getsize(preview_file) > 1000:
                 media_item.preview_file = preview_file
                 media_item.preview_status = "ready"
+                media_item.has_pending_changes = False
                 return preview_file
             else:
                 media_item.preview_status = "error"
                 return "Error: Created preview file is invalid"
-                
+
         except Exception as e:
             self.progress.emit(0, f"Error: {str(e)}")
             media_item.preview_status = "error"
             return f"Error: {str(e)}"
-    
+
     def process_all_clips(self, items):
         """Process all clips for preview - optimized for speed with HW acceleration"""
         try:
             if not items:
                 return "No items to process"
-                
+
             # Use libx264 for maximum compatibility
-            best_encoder = 'libx264'
-            
+            best_encoder = "libx264"
+
             self.progress.emit(5, f"Using CPU encoding for maximum compatibility")
-                
+
             # Process each item
             valid_files = []
             total_items = len(items)
-            
+            total_duration = 0
+
             for i, media_item in enumerate(items):
                 if self._abort:
                     # Clean up any temp files
@@ -588,88 +813,138 @@ class ProcessingWorker(QObject):
                         except Exception as e:
                             print(f"Warning: Failed to clean up temp file: {e}")
                     return "Aborted"
-                    
-                self.progress.emit(int((i / total_items) * 70) + 5, 
-                                  f"Processing item {i+1}/{total_items}...")
-                
+
+                self.progress.emit(
+                    int((i / total_items) * 70) + 5,
+                    f"Processing item {i+1}/{total_items}...",
+                )
+
                 # Use the full duration as specified by user edits
                 if not media_item.is_image:
                     # For video - use full edited duration
-                    preview_duration = (media_item.end_time or media_item.duration) - media_item.start_time
+                    preview_duration = (
+                        media_item.end_time or media_item.duration
+                    ) - media_item.start_time
                 else:
-                    # For images - use full display duration 
+                    # For images - use full display duration
                     preview_duration = media_item.display_duration
-                    
+
+                # Add to total duration
+                total_duration += preview_duration
+
                 # Create a temporary preview for this item
-                temp_preview = os.path.join(TEMP_DIR, f"temp_preview_{i}_{uuid.uuid4().hex[:8]}.mp4")
-                
-                # Base command for both image and video - use simpler approach
-                base_cmd = ['ffmpeg', '-y', '-v', 'error']
-                
+                temp_preview = os.path.join(
+                    TEMP_DIR, f"temp_preview_{i}_{uuid.uuid4().hex[:8]}.mp4"
+                )
+
+                # Get effects filter
+                effects_filter = media_item.get_effects_filter_string()
+
+                # Base command for both image and video
+                base_cmd = ["ffmpeg", "-y", "-v", "error"]
+
                 # For images
                 if media_item.is_image:
-                    cmd = base_cmd + [
-                        '-loop', '1',
-                        '-i', media_item.file_path,
-                        '-t', str(preview_duration),
-                        '-vf', 'scale=480:-2,fps=24',
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '28',
-                        '-pix_fmt', 'yuv420p',
-                        '-f', 'mp4',
-                        temp_preview
-                    ]
-                    
+                    # Build the filter string
+                    vf = "scale=480:-2,fps=24"
+
                     # Add rotation if needed
                     if media_item.manual_rotation != 0:
-                        cmd[9] = f'rotate={media_item.manual_rotation*math.pi/180},scale=480:-2,fps=24'
-                else:
-                    # For videos - use faster settings but keep full duration 
+                        rotation = f"rotate={media_item.manual_rotation*math.pi/180}"
+                        vf = f"{rotation},{vf}"
+
+                    # Add effects if any
+                    if effects_filter:
+                        vf = f"{effects_filter},{vf}"
+
+                    # Build command
                     cmd = base_cmd + [
-                        '-ss', str(media_item.start_time),
-                        '-i', media_item.file_path,
-                        '-t', str(preview_duration),
-                        '-vf', 'scale=480:-2,fps=24',
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '28',
-                        '-c:a', 'aac',  # Include audio for a proper preview
-                        '-b:a', '96k',   # Lower audio bitrate for faster processing
-                        '-pix_fmt', 'yuv420p',
-                        '-f', 'mp4',
-                        temp_preview
+                        "-loop",
+                        "1",
+                        "-i",
+                        media_item.file_path,
+                        "-t",
+                        str(preview_duration),
+                        "-vf",
+                        vf,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "28",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "mp4",
+                        temp_preview,
                     ]
-                    
+                else:
+                    # For videos - build the filter string
+                    vf = "scale=480:-2,fps=24"
+
                     # Add rotation if needed
-                    total_rotation = (media_item.rotation + media_item.manual_rotation) % 360
+                    total_rotation = (
+                        media_item.rotation + media_item.manual_rotation
+                    ) % 360
                     if total_rotation != 0:
-                        rotation_filter = ''
+                        rotation_filter = ""
                         if total_rotation == 90:
-                            rotation_filter = 'transpose=1,'
+                            rotation_filter = "transpose=1,"
                         elif total_rotation == 180:
-                            rotation_filter = 'transpose=2,transpose=2,'
+                            rotation_filter = "transpose=2,transpose=2,"
                         elif total_rotation == 270:
-                            rotation_filter = 'transpose=2,'
-                        
-                        cmd[8] = f'{rotation_filter}scale=480:-2,fps=24'
-                
+                            rotation_filter = "transpose=2,"
+                        vf = f"{rotation_filter}{vf}"
+
+                    # Add effects if any
+                    if effects_filter:
+                        vf = f"{effects_filter},{vf}"
+
+                    # Build command
+                    cmd = base_cmd + [
+                        "-ss",
+                        str(media_item.start_time),
+                        "-i",
+                        media_item.file_path,
+                        "-t",
+                        str(preview_duration),
+                        "-vf",
+                        vf,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "28",
+                        "-c:a",
+                        "aac",  # Include audio for a proper preview
+                        "-b:a",
+                        "96k",  # Lower audio bitrate for faster processing
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "mp4",
+                        temp_preview,
+                    ]
+
                 # Run command with process monitoring to allow cancellation
                 try:
-                    self.progress.emit(int((i / total_items) * 60) + 10, 
-                                     f"Processing {os.path.basename(media_item.file_path)}...")
-                    
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True
+                    self.progress.emit(
+                        int((i / total_items) * 60) + 10,
+                        f"Processing {os.path.basename(media_item.file_path)}...",
                     )
-                    
+
+                    process = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+
                     # Monitor the process with timeout
                     start_time = time.time()
-                    max_processing_time = max(60, preview_duration * 2)  # Allow more time for longer clips
-                    
+                    max_processing_time = max(
+                        60, preview_duration * 2
+                    )  # Allow more time for longer clips
+
                     while process.poll() is None:
                         # Check for abort
                         if self._abort:
@@ -687,56 +962,231 @@ class ProcessingWorker(QObject):
                                 except:
                                     pass
                             return "Aborted"
-                        
+
                         # Check for timeout
                         if time.time() - start_time > max_processing_time:
                             process.terminate()
-                            print(f"Processing timeout for {media_item.file_path} after {max_processing_time} seconds")
+                            print(
+                                f"Processing timeout for {media_item.file_path} after {max_processing_time} seconds"
+                            )
                             break
-                        
+
                         # Wait a bit before checking again
                         time.sleep(0.1)
-                    
+
                     # Get any error output
                     _, stderr = process.communicate(timeout=1)
-                    
+
                     # Check if file was created successfully
-                    if os.path.exists(temp_preview) and os.path.getsize(temp_preview) > 1000:
+                    if (
+                        os.path.exists(temp_preview)
+                        and os.path.getsize(temp_preview) > 1000
+                    ):
                         valid_files.append(temp_preview)
+                        # Mark the item as having no pending changes
+                        media_item.has_pending_changes = False
                     else:
-                        print(f"Error creating preview for {media_item.file_path}: {stderr}")
+                        print(
+                            f"Error creating preview for {media_item.file_path}: {stderr}"
+                        )
                 except Exception as e:
                     print(f"Error processing file {media_item.file_path}: {str(e)}")
                     # Skip this file on any error
                     pass
-            
+
             if not valid_files:
                 return "Failed to create any valid previews"
-            
+
             # Handle case with only one valid file - just return it directly
             if len(valid_files) == 1:
-                output_file = os.path.join(TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4")
+                output_file = os.path.join(
+                    TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4"
+                )
+
+                # Check if music should be added to single file
+                if self.music_tracks or (
+                    self.music_file and os.path.exists(self.music_file)
+                ):
+                    self.progress.emit(80, "Adding background music...")
+
+                    # Use music tracks if available, otherwise use single music file
+                    if self.music_tracks:
+                        # Create a complex filter for multiple music tracks
+                        music_filters = ""
+                        music_mix = ""
+
+                        # Build command base
+                        cmd_parts = [
+                            "ffmpeg",
+                            "-y",
+                            "-v",
+                            "error",
+                            "-i",
+                            valid_files[0],  # First input is the video
+                        ]
+
+                        # Add input for each music track
+                        track_ids = []
+                        for i, track in enumerate(self.music_tracks):
+                            if not os.path.exists(track.file_path):
+                                continue
+
+                            # Add input for this track
+                            cmd_parts.extend(["-i", track.file_path])
+                            input_idx = i + 1  # Input index in ffmpeg (0 is video)
+                            track_id = f"m{i}"
+                            track_ids.append(track_id)
+
+                            # Add volume and trim filter
+                            music_filters += f"[{input_idx}:a]volume={track.volume}"
+
+                            # Add trim if needed
+                            if track.start_time_in_track > 0 or track.duration:
+                                music_filters += (
+                                    f",atrim=start={track.start_time_in_track}"
+                                )
+                                if track.duration:
+                                    music_filters += f":duration={track.duration}"
+
+                            # Add delay if needed (for start time in compilation)
+                            if track.start_time_in_compilation > 0:
+                                music_filters += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
+
+                            # Name the output
+                            music_filters += f"[{track_id}];"
+
+                        # Combine all music tracks if there are multiple
+                        if len(track_ids) > 1:
+                            music_mix = (
+                                "".join([f"[{tid}]" for tid in track_ids])
+                                + f"amix=inputs={len(track_ids)}:duration=longest[music];"
+                            )
+                        elif len(track_ids) == 1:
+                            music_mix = (
+                                f"[{track_ids[0]}]aformat=sample_fmts=fltp[music];"
+                            )
+
+                        # Combine with original audio if we have music
+                        if music_mix:
+                            filter_complex = f"{music_filters}{music_mix}[0:a][music]amix=inputs=2:duration=first[a]"
+
+                            # Complete command
+                            cmd_parts.extend(
+                                [
+                                    "-filter_complex",
+                                    filter_complex,
+                                    "-map",
+                                    "0:v",
+                                    "-map",
+                                    "[a]",
+                                    "-c:v",
+                                    "copy",
+                                    "-c:a",
+                                    "aac",
+                                    "-b:a",
+                                    "128k",
+                                    output_file,
+                                ]
+                            )
+
+                            cmd = cmd_parts
+                        else:
+                            # No valid music tracks, just copy the file
+                            shutil.copy(valid_files[0], output_file)
+                            if (
+                                os.path.exists(output_file)
+                                and os.path.getsize(output_file) > 1000
+                            ):
+                                self.progress.emit(100, "Preview ready (single clip)")
+                                return (output_file, total_duration)
+                    else:
+                        # Legacy: Add music to single file using the simple approach
+                        cmd = [
+                            "ffmpeg",
+                            "-y",
+                            "-v",
+                            "error",
+                            "-i",
+                            valid_files[0],
+                            "-i",
+                            self.music_file,
+                            "-filter_complex",
+                            f"[1:a]volume={self.music_volume}[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                            "-map",
+                            "0:v",
+                            "-map",
+                            "[a]",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                            output_file,
+                        ]
+
+                    process = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+
+                    # Monitor with timeout
+                    start_time = time.time()
+                    while process.poll() is None:
+                        if self._abort:
+                            process.terminate()
+                            try:
+                                if os.path.exists(output_file):
+                                    os.unlink(output_file)
+                            except:
+                                pass
+                            return "Aborted"
+
+                        if time.time() - start_time > 60:
+                            process.terminate()
+                            break
+
+                        time.sleep(0.1)
+
+                    # Return result with duration
+                    if (
+                        os.path.exists(output_file)
+                        and os.path.getsize(output_file) > 1000
+                    ):
+                        self.progress.emit(100, "Preview ready (with music)")
+                        # Clean up temp files
+                        for file in valid_files:
+                            try:
+                                if os.path.exists(file):
+                                    os.unlink(file)
+                            except:
+                                pass
+                        return (output_file, total_duration)
+
+                # If music addition failed or wasn't requested, just copy the file
                 try:
                     shutil.copy(valid_files[0], output_file)
-                    if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
+                    if (
+                        os.path.exists(output_file)
+                        and os.path.getsize(output_file) > 1000
+                    ):
                         self.progress.emit(100, "Preview ready (single clip)")
-                        return output_file
+                        return (output_file, total_duration)
                 except Exception as e:
                     print(f"Error copying single file: {str(e)}")
-            
+
             # Concatenate all files
             self.progress.emit(80, "Combining all clips...")
-            
+
             # Output file
             output_file = os.path.join(TEMP_DIR, f"preview_all_{uuid.uuid4().hex}.mp4")
-            
+
             # Create a temporary file list for concat
             file_list = os.path.join(TEMP_DIR, f"files_{uuid.uuid4().hex}.txt")
-            with open(file_list, 'w') as f:
+            with open(file_list, "w") as f:
                 for file_path in valid_files:
-                    fixed_path = file_path.replace('\\', '/')
+                    fixed_path = file_path.replace("\\", "/")
                     f.write(f"file '{fixed_path}'\n")
-            
+
             # Check for cancellation
             if self._abort:
                 # Clean up
@@ -749,32 +1199,36 @@ class ProcessingWorker(QObject):
                 except:
                     pass
                 return "Aborted"
-            
+
             # Try to use the concat demuxer first (faster)
             cmd = [
-                'ffmpeg', '-y', '-v', 'error',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', file_list,
-                '-c', 'copy',
-                output_file
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                file_list,
+                "-c",
+                "copy",
+                output_file,
             ]
-            
+
             # Run with monitoring
             process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
             )
-            
+
             # Monitor the process
             start_time = time.time()
             while process.poll() is None:
                 # Check for abort
                 if self._abort:
                     process.terminate()
-                    
+
                     # Clean up
                     try:
                         if os.path.exists(file_list):
@@ -787,23 +1241,202 @@ class ProcessingWorker(QObject):
                     except:
                         pass
                     return "Aborted"
-                
+
                 # Check for timeout (longer for concat)
                 if time.time() - start_time > 60:  # 60 seconds timeout
                     process.terminate()
                     print("Concat operation timed out after 60 seconds")
                     break
-                    
+
                 # Wait a bit
                 time.sleep(0.1)
-            
+
             # Clean up file list
             if os.path.exists(file_list):
                 os.unlink(file_list)
-            
+
+            # Add background music if provided
+            if (
+                os.path.exists(output_file)
+                and os.path.getsize(output_file) > 1000
+            ):
+                # Check if we have music tracks or legacy music file
+                if self.music_tracks or (
+                    self.music_file and os.path.exists(self.music_file)
+                ):
+                    self.progress.emit(90, "Adding background music...")
+                    output_with_music = os.path.join(
+                        TEMP_DIR, f"preview_all_music_{uuid.uuid4().hex}.mp4"
+                    )
+                    music_added = False
+
+                    # Use music tracks if available, otherwise fall back to legacy mode
+                    if self.music_tracks:
+                        # Create a complex filter for multiple music tracks
+                        music_filters = ""
+                        music_mix = ""
+
+                        # Build command base
+                        cmd_parts = [
+                            "ffmpeg",
+                            "-y",
+                            "-v",
+                            "error",
+                            "-i",
+                            output_file,  # First input is the video
+                        ]
+
+                        # Add input for each music track
+                        track_ids = []
+                        for i, track in enumerate(self.music_tracks):
+                            if not os.path.exists(track.file_path):
+                                continue
+
+                            # Add input for this track
+                            cmd_parts.extend(["-i", track.file_path])
+                            input_idx = i + 1  # Input index in ffmpeg (0 is video)
+                            track_id = f"m{i}"
+                            track_ids.append(track_id)
+
+                            # Add volume and trim filter
+                            music_filters += f"[{input_idx}:a]volume={track.volume}"
+
+                            # Add trim if needed
+                            if track.start_time_in_track > 0 or track.duration:
+                                music_filters += (
+                                    f",atrim=start={track.start_time_in_track}"
+                                )
+                                if track.duration:
+                                    music_filters += f":duration={track.duration}"
+
+                            # Add delay if needed (for start time in compilation)
+                            if track.start_time_in_compilation > 0:
+                                music_filters += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
+
+                            # Name the output
+                            music_filters += f"[{track_id}];"
+
+                        # Combine all music tracks if there are multiple
+                        if len(track_ids) > 1:
+                            music_mix = (
+                                "".join([f"[{tid}]" for tid in track_ids])
+                                + f"amix=inputs={len(track_ids)}:duration=longest[music];"
+                            )
+                        elif len(track_ids) == 1:
+                            music_mix = (
+                                f"[{track_ids[0]}]aformat=sample_fmts=fltp[music];"
+                            )
+
+                        # Combine with original audio if we have music
+                        if music_mix:
+                            filter_complex = f"{music_filters}{music_mix}[0:a][music]amix=inputs=2:duration=first[a]"
+
+                            # Complete command
+                            cmd_parts.extend(
+                                [
+                                    "-filter_complex",
+                                    filter_complex,
+                                    "-map",
+                                    "0:v",
+                                    "-map",
+                                    "[a]",
+                                    "-c:v",
+                                    "copy",
+                                    "-c:a",
+                                    "aac",
+                                    "-b:a",
+                                    "128k",
+                                    "-shortest",
+                                    output_with_music,
+                                ]
+                            )
+
+                            cmd = cmd_parts
+                            music_added = True
+                        else:
+                            # No valid music tracks, just copy the file
+                            try:
+                                shutil.copy(output_file, output_with_music)
+                                music_added = True
+                            except Exception as e:
+                                print(f"Error copying file for music: {str(e)}")
+                    else:
+                        # Legacy mode with single music file
+                        if self.music_file and os.path.exists(self.music_file):
+                            cmd = [
+                                "ffmpeg",
+                                "-y",
+                                "-v",
+                                "error",
+                                "-i",
+                                output_file,
+                                "-i",
+                                self.music_file,
+                                "-filter_complex",
+                                f"[1:a]volume={self.music_volume},aloop=loop=-1:size=2e+09[music];[0:a][music]amix=inputs=2:duration=first[a]",
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "[a]",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                                "-shortest",
+                                output_with_music,
+                            ]
+                            music_added = True
+
+                    # Run ffmpeg command if we have a valid command
+                    if music_added and "cmd" in locals():
+                        process = subprocess.Popen(
+                            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                        )
+
+                        # Monitor with timeout
+                        start_time = time.time()
+                        max_processing_time = max(
+                            60, total_duration * 0.5
+                        )  # Less time needed for just adding audio
+
+                        while process.poll() is None:
+                            if self._abort:
+                                process.terminate()
+                                try:
+                                    if os.path.exists(output_with_music):
+                                        os.unlink(output_with_music)
+                                except:
+                                    pass
+                                return "Aborted"
+
+                            if time.time() - start_time > max_processing_time:
+                                process.terminate()
+                                break
+
+                            time.sleep(0.1)
+
+                        # Check if music addition succeeded
+                        if (
+                            os.path.exists(output_with_music)
+                            and os.path.getsize(output_with_music) > 1000
+                        ):
+                            try:
+                                # Remove original without music
+                                if os.path.exists(output_file):
+                                    os.unlink(output_file)
+
+                                # Use the version with music
+                                output_file = output_with_music
+                            except Exception as e:
+                                print(f"Error replacing output file: {str(e)}")
+
             # Check if concat succeeded
             if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
-                self.progress.emit(100, "Preview ready")
+                self.progress.emit(
+                    100, "Preview ready" + (" with music" if self.music_file else "")
+                )
                 # Clean up individual files
                 for file in valid_files:
                     try:
@@ -811,118 +1444,20 @@ class ProcessingWorker(QObject):
                             os.unlink(file)
                     except:
                         pass
-                return output_file
+                return (output_file, total_duration)
             else:
-                # If concat failed, try filter_complex method
-                self.progress.emit(90, "Trying alternate merge method...")
-                
-                # Use filter_complex for concatenation
-                cmd = ['ffmpeg', '-y', '-v', 'error']
-                
-                # Add input files (use all files)
-                for file in valid_files:
-                    cmd.extend(['-i', file])
-                
-                # Create filter string
-                filter_str = ''
-                for i in range(len(valid_files)):
-                    filter_str += f'[{i}:v]'
-                filter_str += f'concat=n={len(valid_files)}:v=1:a=0[outv]'
-                
-                # Add audio from first file with audio if available
-                audio_found = False
-                for i, temp_file in enumerate(valid_files):
-                    try:
-                        audio_info = subprocess.run(
-                            ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_streams', '-of', 'json', temp_file],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                        )
-                        if '"codec_type":"audio"' in audio_info.stdout:
-                            filter_str += f';[{i}:a]acopy[outa]'
-                            audio_found = True
-                            break
-                    except:
-                        pass
-                
-                cmd.extend([
-                    '-filter_complex', filter_str,
-                    '-map', '[outv]'
-                ])
-                
-                if audio_found:
-                    cmd.extend(['-map', '[outa]'])
-                
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-crf', '28',
-                    '-pix_fmt', 'yuv420p'
-                ])
-                
-                if audio_found:
-                    cmd.extend([
-                        '-c:a', 'aac',
-                        '-b:a', '96k'
-                    ])
-                
-                cmd.append(output_file)
-                
-                # Run the command with monitoring
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
+                # Try one last approach: just return the first clip
+                fallback_file = os.path.join(
+                    TEMP_DIR, f"fallback_preview_{uuid.uuid4().hex}.mp4"
                 )
-                
-                # Monitor with timeout
-                start_time = time.time()
-                while process.poll() is None:
-                    # Check for abort
-                    if self._abort:
-                        process.terminate()
-                        # Clean up
-                        try:
-                            if os.path.exists(output_file):
-                                os.unlink(output_file)
-                            for file in valid_files:
-                                if os.path.exists(file):
-                                    os.unlink(file)
-                        except:
-                            pass
-                        return "Aborted"
-                        
-                    # Check for timeout
-                    if time.time() - start_time > 120:  # 2 minutes timeout
-                        process.terminate()
-                        print("Complex concatenation timed out after 120 seconds")
-                        break
-                        
-                    # Wait a bit
-                    time.sleep(0.1)
-                
-                # Final check
-                if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
-                    self.progress.emit(100, "Preview ready")
-                    # Clean up
-                    for file in valid_files:
-                        try:
-                            if os.path.exists(file):
-                                os.unlink(file)
-                        except:
-                            pass
-                    return output_file
-                else:
-                    # Try one last approach: just return the first clip
-                    fallback_file = os.path.join(TEMP_DIR, f"fallback_preview_{uuid.uuid4().hex}.mp4")
-                    try:
-                        shutil.copy(valid_files[0], fallback_file)
-                        self.progress.emit(100, "Preview ready (single clip fallback)")
-                        return fallback_file
-                    except Exception as e:
-                        print(f"Final fallback failed: {str(e)}")
-                        return "Error: Failed to create combined preview"
-                
+                try:
+                    shutil.copy(valid_files[0], fallback_file)
+                    self.progress.emit(100, "Preview ready (single clip fallback)")
+                    return (fallback_file, total_duration)
+                except Exception as e:
+                    print(f"Final fallback failed: {str(e)}")
+                    return "Error: Failed to create combined preview"
+
         except Exception as e:
             print(f"Error in process_all_clips: {str(e)}")
             return f"Error: {str(e)}"
@@ -932,21 +1467,21 @@ class ProcessingWorker(QObject):
         try:
             if not items:
                 return "No items to process"
-            
+
             self.progress.emit(5, "Starting export...")
-            
+
             # Create a temporary directory for intermediate files
             export_temp = os.path.join(TEMP_DIR, f"export_{uuid.uuid4().hex}")
             os.makedirs(export_temp, exist_ok=True)
-            
+
             # Process each item to create intermediate files
             temp_files = []
             total_items = len(items)
-            
+
             # Get best available encoder for final export
             hw_encoders = check_hw_encoders()
-            final_encoder = 'libx264'  # Use software encoding for compatibility
-            
+            final_encoder = "libx264"  # Use software encoding for compatibility
+
             for i, media_item in enumerate(items):
                 if self._abort:
                     # Clean up temp files
@@ -956,83 +1491,134 @@ class ProcessingWorker(QObject):
                                 os.unlink(file)
                         except:
                             pass
-                    
+
                     try:
                         shutil.rmtree(export_temp)
                     except:
                         pass
-                    
+
                     return "Aborted"
-                
+
                 # Update progress
-                self.progress.emit(int((i / total_items) * 60) + 5, 
-                                f"Processing item {i+1}/{total_items}...")
-                
+                self.progress.emit(
+                    int((i / total_items) * 60) + 5,
+                    f"Processing item {i+1}/{total_items}...",
+                )
+
                 # Temp file for this item
                 temp_file = os.path.join(export_temp, f"part_{i:04d}.mp4")
-                
+
+                # Get effects filters if any
+                effects_filter = media_item.get_effects_filter_string()
+
                 # Handle images vs videos
                 if media_item.is_image:
                     # Image to video
                     cmd = [
-                        'ffmpeg', '-y',
-                        '-loop', '1',
-                        '-i', media_item.file_path,
-                        '-t', str(media_item.display_duration),
-                        '-c:v', 'libx264',
-                        '-preset', 'medium',
-                        '-crf', '22',
-                        '-pix_fmt', 'yuv420p'
+                        "ffmpeg",
+                        "-y",
+                        "-loop",
+                        "1",
+                        "-i",
+                        media_item.file_path,
+                        "-t",
+                        str(media_item.display_duration),
                     ]
-                    
+
+                    # Build filter string
+                    vf = "scale=-2:720"
+
                     # Add rotation if needed
                     if media_item.manual_rotation != 0:
-                        cmd.extend([
-                            '-vf', f'rotate={media_item.manual_rotation*math.pi/180},scale=-2:720'
-                        ])
-                    else:
-                        # Always add scale filter to ensure dimensions are even
-                        cmd.extend(['-vf', 'scale=-2:720'])
-                    
-                    cmd.append(temp_file)
-                    
+                        rotation = f"rotate={media_item.manual_rotation*math.pi/180}"
+                        vf = f"{rotation},{vf}"
+
+                    # Add effects if any
+                    if effects_filter:
+                        vf = f"{effects_filter},{vf}"
+
+                    # Add filter and output options
+                    cmd.extend(
+                        [
+                            "-vf",
+                            vf,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "medium",
+                            "-crf",
+                            "22",
+                            "-pix_fmt",
+                            "yuv420p",
+                            temp_file,
+                        ]
+                    )
+
                 else:
                     # Video clip
                     cmd = [
-                        'ffmpeg', '-y',
-                        '-ss', str(media_item.start_time),
-                        '-i', media_item.file_path,
-                        '-t', str((media_item.end_time or media_item.duration) - media_item.start_time),
-                        '-c:v', 'libx264',
-                        '-preset', 'medium',
-                        '-crf', '22',
-                        '-c:a', 'aac',
-                        '-b:a', '128k'
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        str(media_item.start_time),
+                        "-i",
+                        media_item.file_path,
+                        "-t",
+                        str(
+                            (media_item.end_time or media_item.duration)
+                            - media_item.start_time
+                        ),
                     ]
-                    
+
+                    # Build filter string
+                    vf = "scale=-2:720"
+
                     # Add rotation if needed
-                    total_rotation = (media_item.rotation + media_item.manual_rotation) % 360
+                    total_rotation = (
+                        media_item.rotation + media_item.manual_rotation
+                    ) % 360
                     if total_rotation != 0:
                         if total_rotation == 90:
-                            cmd.extend(['-vf', 'transpose=1,scale=-2:720'])
+                            rotation_filter = "transpose=1"
                         elif total_rotation == 180:
-                            cmd.extend(['-vf', 'transpose=2,transpose=2,scale=-2:720'])
+                            rotation_filter = "transpose=2,transpose=2"
                         elif total_rotation == 270:
-                            cmd.extend(['-vf', 'transpose=2,scale=-2:720'])
-                    else:
-                        # Always add scale filter to ensure dimensions are even
-                        cmd.extend(['-vf', 'scale=-2:720'])
-                
-                    cmd.append(temp_file)
-                
+                            rotation_filter = "transpose=2"
+                        vf = f"{rotation_filter},{vf}"
+
+                    # Add effects if any
+                    if effects_filter:
+                        vf = f"{effects_filter},{vf}"
+
+                    # Add filter and output options
+                    cmd.extend(
+                        [
+                            "-vf",
+                            vf,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "medium",
+                            "-crf",
+                            "22",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "128k",
+                            "-pix_fmt",
+                            "yuv420p",
+                            temp_file,
+                        ]
+                    )
+
                 # Run the command
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    universal_newlines=True
+                    universal_newlines=True,
                 )
-                
+
                 # Monitor process
                 while process.poll() is None:
                     # Check for abort
@@ -1045,17 +1631,17 @@ class ProcessingWorker(QObject):
                                     os.unlink(file)
                             except:
                                 pass
-                        
+
                         try:
                             shutil.rmtree(export_temp)
                         except:
                             pass
-                        
+
                         return "Aborted"
-                    
+
                     # Wait a bit to avoid busy waiting
                     time.sleep(0.1)
-                
+
                 # Check if file was created successfully
                 if os.path.exists(temp_file) and os.path.getsize(temp_file) > 1000:
                     temp_files.append(temp_file)
@@ -1063,184 +1649,334 @@ class ProcessingWorker(QObject):
                     stdout, stderr = process.communicate()
                     print(f"Error creating temp file for item {i}: {stderr}")
                     continue  # Skip this file
-            
+
             # Check if we have any valid files
             if not temp_files:
                 return "Error: No valid media files could be processed"
-            
+
             # Create a file list for concatenation
             file_list = os.path.join(export_temp, "files.txt")
-            with open(file_list, 'w') as f:
+            with open(file_list, "w") as f:
                 for temp_file in temp_files:
-                    fixed_path = temp_file.replace('\\', '/')
+                    fixed_path = temp_file.replace("\\", "/")
                     f.write(f"file '{fixed_path}'\n")
-            
+
             # Concatenate all the files
             self.progress.emit(70, "Combining all clips...")
-            
+
             # First try fast concat
             cmd = [
-                'ffmpeg', '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', file_list,
-                '-c', 'copy',
-                output_path
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                file_list,
+                "-c",
+                "copy",
+                output_path,
             ]
-            
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
             )
-            
+
             # Monitor process
             while process.poll() is None:
                 # Check for abort
                 if self._abort:
                     process.terminate()
-                    
+
                     # Clean up
                     try:
                         if os.path.exists(output_path):
                             os.unlink(output_path)
                     except:
                         pass
-                    
+
                     for file in temp_files:
                         try:
                             if os.path.exists(file):
                                 os.unlink(file)
                         except:
                             pass
-                    
+
                     try:
                         shutil.rmtree(export_temp)
                     except:
                         pass
-                    
+
                     return "Aborted"
-                
+
                 # Wait a bit to avoid busy waiting
                 time.sleep(0.1)
-            
+
             # Check if concat worked
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                # Add music if requested and exported successfully
+                if self.music_tracks:
+                    self.progress.emit(85, "Adding background music...")
+                    output_with_music = os.path.join(
+                        export_temp, f"export_music_{uuid.uuid4().hex}.mp4"
+                    )
+
+                    # Create a complex filter for multiple music tracks
+                    music_filters = ""
+                    music_mix = ""
+
+                    # Build command base
+                    cmd_parts = [
+                        "ffmpeg",
+                        "-y",
+                        "-v",
+                        "error",
+                        "-i",
+                        output_path,  # First input is the video
+                    ]
+
+                    # Add input for each music track
+                    track_ids = []
+                    for i, track in enumerate(self.music_tracks):
+                        if not os.path.exists(track.file_path):
+                            continue
+
+                        # Add input for this track
+                        cmd_parts.extend(["-i", track.file_path])
+                        input_idx = i + 1  # Input index in ffmpeg (0 is video)
+                        track_id = f"m{i}"
+                        track_ids.append(track_id)
+
+                        # Add volume and trim filter
+                        music_filters += f"[{input_idx}:a]volume={track.volume}"
+
+                        # Add trim if needed
+                        if track.start_time_in_track > 0 or track.duration:
+                            music_filters += f",atrim=start={track.start_time_in_track}"
+                            if track.duration:
+                                music_filters += f":duration={track.duration}"
+
+                        # Add delay if needed (for start time in compilation)
+                        if track.start_time_in_compilation > 0:
+                            music_filters += f",adelay={int(track.start_time_in_compilation*1000)}|{int(track.start_time_in_compilation*1000)}"
+
+                        # Name the output
+                        music_filters += f"[{track_id}];"
+
+                    # Combine all music tracks if there are multiple
+                    if len(track_ids) > 1:
+                        music_mix = (
+                            "".join([f"[{tid}]" for tid in track_ids])
+                            + f"amix=inputs={len(track_ids)}:duration=longest[music];"
+                        )
+                    elif len(track_ids) == 1:
+                        music_mix = f"[{track_ids[0]}]aformat=sample_fmts=fltp[music];"
+
+                    # Combine with original audio if we have music
+                    if music_mix:
+                        filter_complex = f"{music_filters}{music_mix}[0:a][music]amix=inputs=2:duration=first[a]"
+
+                        # Complete command
+                        cmd_parts.extend(
+                            [
+                                "-filter_complex",
+                                filter_complex,
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "[a]",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-shortest",
+                                output_with_music,
+                            ]
+                        )
+
+                        process = subprocess.Popen(
+                            cmd_parts,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+
+                        # Monitor with timeout
+                        start_time = time.time()
+                        while process.poll() is None:
+                            if self._abort:
+                                process.terminate()
+                                try:
+                                    if os.path.exists(output_with_music):
+                                        os.unlink(output_with_music)
+                                except:
+                                    pass
+                                return "Aborted"
+
+                            # Wait a bit
+                            time.sleep(0.1)
+
+                        # Check if music addition succeeded
+                        if (
+                            os.path.exists(output_with_music)
+                            and os.path.getsize(output_with_music) > 1000
+                        ):
+                            try:
+                                # Replace the output file with music version
+                                os.unlink(output_path)
+                                shutil.move(output_with_music, output_path)
+                            except Exception as e:
+                                print(f"Error replacing output file: {str(e)}")
+
                 # Clean up
                 try:
                     shutil.rmtree(export_temp)
                 except:
                     pass
-                
+
                 self.progress.emit(100, "Export complete")
                 return output_path
-            
+
             # If concat failed, try re-encoding
             self.progress.emit(80, "Using alternate export method...")
-            
-            # Create combined filter 
-            filter_complex = ''
-            
+
+            # Create combined filter
+            filter_complex = ""
+
             if len(temp_files) == 1:
                 # Just one file, copy it with re-encoding
                 cmd = [
-                    'ffmpeg', '-y',
-                    '-i', temp_files[0],
-                    '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-crf', '22',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',
-                    '-pix_fmt', 'yuv420p',
-                    output_path
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    temp_files[0],
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "22",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "192k",
+                    "-pix_fmt",
+                    "yuv420p",
+                    output_path,
                 ]
             else:
                 # Multiple files
                 inputs = []
                 for temp_file in temp_files:
-                    inputs.extend(['-i', temp_file])
-                    
+                    inputs.extend(["-i", temp_file])
+
                 # Create filter complex for concat
                 for i in range(len(temp_files)):
-                    filter_complex += f'[{i}:v]'
-                filter_complex += f'concat=n={len(temp_files)}:v=1:a=0[outv];'
-                
+                    filter_complex += f"[{i}:v]"
+                filter_complex += f"concat=n={len(temp_files)}:v=1:a=0[outv];"
+
                 # Add audio if available (from first file)
                 audio_option = []
                 for i, temp_file in enumerate(temp_files):
                     try:
                         audio_info = subprocess.run(
-                            ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_streams', '-of', 'json', temp_file],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                            [
+                                "ffprobe",
+                                "-v",
+                                "error",
+                                "-select_streams",
+                                "a",
+                                "-show_streams",
+                                "-of",
+                                "json",
+                                temp_file,
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
                         )
                         if '"codec_type":"audio"' in audio_info.stdout:
-                            filter_complex += f'[{i}:a]aresample=44100[a{i}];'
-                            audio_option.extend(['-map', f'[a{i}]'])
+                            filter_complex += f"[{i}:a]aresample=44100[a{i}];"
+                            audio_option.extend(["-map", f"[a{i}]"])
                             break
                     except:
                         pass
-                
+
                 # Add video map
-                filter_complex += f'[outv]scale=-2:720[outv2]'
-                
+                filter_complex += f"[outv]scale=-2:720[outv2]"
+
                 # Build final command
-                cmd = ['ffmpeg', '-y'] + inputs + [
-                    '-filter_complex', filter_complex,
-                    '-map', '[outv2]'
-                ] + audio_option + [
-                    '-c:v', 'libx264',
-                    '-preset', 'medium',
-                    '-crf', '22',
-                    '-c:a', 'aac',
-                    '-b:a', '192k',
-                    '-pix_fmt', 'yuv420p',
-                    output_path
-                ]
-            
+                cmd = (
+                    ["ffmpeg", "-y"]
+                    + inputs
+                    + ["-filter_complex", filter_complex, "-map", "[outv2]"]
+                    + audio_option
+                    + [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "22",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-pix_fmt",
+                        "yuv420p",
+                        output_path,
+                    ]
+                )
+
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
             )
-            
+
             # Monitor process
             while process.poll() is None:
                 # Check for abort
                 if self._abort:
                     process.terminate()
-                    
+
                     # Clean up
                     try:
                         if os.path.exists(output_path):
                             os.unlink(output_path)
                     except:
                         pass
-                    
+
                     for file in temp_files:
                         try:
                             if os.path.exists(file):
                                 os.unlink(file)
                         except:
                             pass
-                    
+
                     try:
                         shutil.rmtree(export_temp)
                     except:
                         pass
-                    
+
                     return "Aborted"
-                
+
                 # Sleep a bit to avoid busy waiting
                 time.sleep(0.1)
-            
+
             # Clean up
             try:
                 shutil.rmtree(export_temp)
             except:
                 pass
-            
+
             # Final check
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 self.progress.emit(100, "Export complete")
@@ -1249,17 +1985,19 @@ class ProcessingWorker(QObject):
                 stdout, stderr = process.communicate()
                 print(f"Export failed: {stderr}")
                 return "Error: Failed to create output file"
-        
+
         except Exception as e:
             print(f"Export error: {str(e)}")
             return f"Error: {str(e)}"
 
+
 class ProcessingThread(QThread):
     """Thread that runs video processing operations"""
+
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(str, object)  # task, result
     error = pyqtSignal(str, str)  # task, error message
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.worker = ProcessingWorker()
@@ -1267,10 +2005,10 @@ class ProcessingThread(QThread):
         self.worker.progress.connect(self.progress)
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.error.connect(self.on_worker_error)
-        
+
         self.task = None
         self.args = None
-        
+
     def run(self):
         try:
             if self.task == "preview_item":
@@ -1286,31 +2024,1065 @@ class ProcessingThread(QThread):
                 self.error.emit(self.task, "Unknown task")
         except Exception as e:
             self.error.emit(self.task, str(e))
-            
+
     def on_worker_finished(self, task, result):
         """Handle worker completion"""
         self.finished.emit(self.task, result)
-            
+
     def on_worker_error(self, task, error):
         """Handle worker error"""
         self.error.emit(self.task, error)
-            
+
     def setup_task(self, task, args):
         """Set up the task to be run"""
         self.task = task
         self.args = args
-        
+
     def abort(self):
         """Abort the current task"""
         self.worker.abort()
 
+
+class TimelineWidget(QWidget):
+    """Interactive widget to display the timeline of clips with drag and zoom support"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.clips = []
+        self.total_duration = 0
+        self.current_position = 0
+        self.setMinimumHeight(70)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+        # Scroll and zoom properties
+        self.scroll_offset = 0  # In pixels
+        self.zoom_level = 1.0  # Scale factor (1.0 = fit all clips)
+        self.pixels_per_second = 50  # Base scale when zoom is 1.0
+        self.dragging = False
+        self.drag_start_x = 0
+        self.drag_start_offset = 0
+        self.hover_clip_index = -1
+        self.hover_x = -1
+        self.music_tracks = []  # List of music tracks to display
+        self.has_pending_changes = False  # Flag to indicate unsaved changes
+
+        # Set mouse tracking to handle hover effects
+        self.setMouseTracking(True)
+
+        # Ensure the widget can receive focus for key events
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def set_clips(self, clips):
+        """Set the clips to display"""
+        self.clips = clips
+        self.total_duration = sum(clip.get("duration", 0) for clip in clips)
+        
+        # Adjust zoom level to fit all clips if needed
+        if self.total_duration > 0 and self.width() > 0:
+            min_zoom = max(0.2, self.width() / (self.total_duration * self.pixels_per_second))
+            if self.zoom_level < min_zoom:
+                self.zoom_level = min_zoom
+        
+        self.update()
+
+    def set_music_tracks(self, tracks):
+        """Set music tracks to display in timeline"""
+        self.music_tracks = tracks
+        self.update()
+
+    def set_position(self, position):
+        """Set the current playback position in seconds"""
+        self.current_position = position
+
+        # Auto-scroll to keep playback position visible
+        if self.clips and self.total_duration > 0:
+            # Calculate visible region based on current scroll and widget width
+            pixels_per_second = self.pixels_per_second * self.zoom_level
+            widget_width = self.width()
+
+            # Convert current position to pixels
+            position_x = position * pixels_per_second - self.scroll_offset
+
+            # Check if position is outside visible area
+            if position_x < 0 or position_x > widget_width:
+                # Center the position in the viewport
+                self.scroll_offset = max(0, position * pixels_per_second - widget_width / 2)
+
+        self.update()
+
+    def set_pending_changes(self, has_changes):
+        """Set whether there are pending changes"""
+        self.has_pending_changes = has_changes
+        self.update()
+
+    def timeline_width(self):
+        """Calculate the total width of the timeline in pixels based on zoom"""
+        return max(self.width(), int(self.total_duration * self.pixels_per_second * self.zoom_level))
+
+    def seconds_to_pixels(self, seconds):
+        """Convert a time in seconds to pixels based on current zoom"""
+        return seconds * self.pixels_per_second * self.zoom_level
+
+    def pixels_to_seconds(self, pixels):
+        """Convert pixels to seconds based on current zoom"""
+        if self.pixels_per_second * self.zoom_level == 0:
+            return 0
+        return pixels / (self.pixels_per_second * self.zoom_level)
+
+    def mousePressEvent(self, event):
+        """Handle mouse press events for dragging"""
+        if event.button() == Qt.LeftButton:
+            self.dragging = True
+            self.drag_start_x = event.x()
+            self.drag_start_offset = self.scroll_offset
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release events for dragging"""
+        if event.button() == Qt.LeftButton and self.dragging:
+            self.dragging = False
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Handle mouse move events for dragging and hover effects"""
+        if self.dragging:
+            # Calculate drag distance
+            delta_x = event.x() - self.drag_start_x
+            new_offset = max(0, self.drag_start_offset - delta_x)
+
+            # Limit scrolling to timeline width
+            max_offset = max(0, self.timeline_width() - self.width())
+            self.scroll_offset = min(new_offset, max_offset)
+
+            self.update()
+        else:
+            # For hover effects, determine which clip is under the cursor
+            self.hover_x = event.x()
+            self.hover_clip_index = self.get_clip_at_position(int(event.x() + self.scroll_offset))
+            self.update()
+
+        super().mouseMoveEvent(event)
+
+    def wheelEvent(self, event):
+        """Handle mouse wheel events for zooming"""
+        if event.modifiers() & Qt.ControlModifier:
+            # Zoom in/out
+            zoom_delta = 0.1 if event.angleDelta().y() > 0 else -0.1
+            old_zoom = self.zoom_level
+            self.zoom_level = max(0.1, min(10.0, self.zoom_level + zoom_delta))
+
+            # Adjust scroll offset to zoom around cursor position
+            cursor_x = int(event.x() + self.scroll_offset)
+            cursor_time = self.pixels_to_seconds(cursor_x)
+
+            # Calculate new position after zoom
+            new_cursor_x = self.seconds_to_pixels(cursor_time)
+            self.scroll_offset = max(0, new_cursor_x - event.x())
+
+            # Limit scrolling to timeline width
+            max_offset = max(0, self.timeline_width() - self.width())
+            self.scroll_offset = min(self.scroll_offset, max_offset)
+        else:
+            # Horizontal scrolling
+            delta = event.angleDelta().y()
+            scroll_delta = 100 if delta < 0 else -100
+            new_offset = max(0, self.scroll_offset + scroll_delta)
+
+            # Limit scrolling to timeline width
+            max_offset = max(0, self.timeline_width() - self.width())
+            self.scroll_offset = min(new_offset, max_offset)
+
+        self.update()
+        event.accept()
+
+    def get_clip_at_position(self, pixel_x):
+        """Get the index of the clip at the given pixel position"""
+        if not self.clips:
+            return -1
+
+        pixels_per_second = self.pixels_per_second * self.zoom_level
+        x = 0
+
+        for i, clip in enumerate(self.clips):
+            clip_duration = clip.get("duration", 0)
+            if clip_duration <= 0:
+                continue
+
+            clip_width = int(clip_duration * pixels_per_second)
+            if x <= pixel_x < x + clip_width:
+                return i
+
+            x += clip_width
+
+        return -1
+
+    def format_time(self, seconds):
+        """Format time in seconds to mm:ss.ms"""
+        minutes = int(seconds // 60)
+        seconds_remainder = seconds % 60
+        return f"{minutes}:{int(seconds_remainder):02d}.{int((seconds_remainder * 100) % 100):02d}"
+
+    def paintEvent(self, event):
+        """Draw the timeline"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width = self.width()
+        height = self.height()
+
+        # Draw background
+        painter.fillRect(0, 0, width, height, QColor(30, 30, 30))
+
+        # Calculate pixels per second based on zoom
+        pixels_per_second = self.pixels_per_second * self.zoom_level
+
+        # Draw time markers and grid
+        self.draw_time_markers(painter, width, height, pixels_per_second)
+
+        # Draw clips
+        if not self.clips or self.total_duration <= 0:
+            painter.setPen(QColor(200, 200, 200))
+            painter.drawText(10, height // 2 + 5, "No clips available")
+            return
+
+        # Calculate music track height and main clips height
+        music_height = 0
+        if self.music_tracks:
+            music_height = min(height * 0.25, 20 * len(self.music_tracks))
+        
+        main_clip_height = height - music_height - 5 if music_height > 0 else height
+
+        # Draw clips with offset for scrolling
+        x = -int(self.scroll_offset)
+        for i, clip in enumerate(self.clips):
+            clip_duration = clip.get("duration", 0)
+            if clip_duration <= 0:
+                continue
+
+            # Calculate width based on duration
+            clip_width = max(int(clip_duration * pixels_per_second), 2)
+
+            # Skip clips outside the view
+            if x + clip_width < 0 or x > width:
+                x += clip_width
+                continue
+
+            # Determine if this clip is being hovered
+            is_hover = i == self.hover_clip_index
+
+            # Draw clip
+            is_image = clip.get("is_image", False)
+            has_changes = clip.get("has_pending_changes", False)
+            clip_rect = QRect(x, 5, clip_width, main_clip_height - 10)
+
+            # Clip background
+            if is_image:
+                base_color = QColor(60, 179, 113)  # Green for images
+            else:
+                base_color = QColor(65, 105, 225)  # Blue for videos
+
+            # Adjust color for hover state
+            if is_hover:
+                base_color = base_color.lighter(130)
+
+            painter.fillRect(clip_rect, base_color)
+
+            # Draw pending changes indicator if needed
+            if has_changes:
+                indicator_rect = QRect(x + 5, 10, 10, 10)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(255, 165, 0))  # Orange for pending changes
+                painter.drawEllipse(indicator_rect)
+
+            # Draw border
+            border_color = QColor(200, 200, 200)
+            painter.setPen(QPen(border_color, 1))
+            painter.drawRect(clip_rect)
+
+            # Draw clip number
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(x + 5, 20, f"{i+1}")
+
+            # Draw clip name (truncated if needed)
+            clip_name = clip.get("name", "")
+            name_rect = QRect(x + 5, main_clip_height // 2 - 10, clip_width - 10, 20)
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+
+            if clip_width > 60:  # Only draw name if clip is wide enough
+                name = painter.fontMetrics().elidedText(clip_name, Qt.ElideMiddle, clip_width - 10)
+                painter.drawText(name_rect, Qt.AlignCenter, name)
+
+            # Draw duration
+            duration_text = self.format_time(clip_duration)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(x + 5, main_clip_height - 10, duration_text)
+
+            # Draw hover information if this clip is being hovered
+            if is_hover and clip_width > 20:
+                hover_pos = self.hover_x - x
+                hover_time = self.pixels_to_seconds(hover_pos)
+                if 0 <= hover_time <= clip_duration:
+                    # Calculate the position within this clip
+                    clip_start_time = clip.get("start_time", 0)
+                    absolute_time = clip_start_time + hover_time
+
+                    # Draw time indicator
+                    painter.setPen(QPen(QColor(255, 165, 0), 2))  # Orange line
+                    hover_x_pos = int(x + hover_pos)
+                    painter.drawLine(hover_x_pos, 5, hover_x_pos, main_clip_height - 5)
+
+                    # Draw time label
+                    time_label = f"{self.format_time(absolute_time)}"
+                    painter.fillRect(hover_x_pos - 40, main_clip_height - 30, 80, 20, QColor(0, 0, 0, 180))
+                    painter.setPen(QColor(255, 165, 0))
+                    painter.drawText(hover_x_pos - 40, main_clip_height - 30, 80, 20, Qt.AlignCenter, time_label)
+
+            x += clip_width
+
+        # Draw music tracks if any
+        if self.music_tracks and music_height > 0:
+            track_height = music_height / len(self.music_tracks)
+            y_offset = main_clip_height + 5
+            
+            # Draw music track background
+            painter.fillRect(0, y_offset, width, music_height, QColor(40, 40, 40))
+            
+            # Draw track separator
+            painter.setPen(QPen(QColor(60, 60, 60), 1))
+            painter.drawLine(0, y_offset, width, y_offset)
+            
+            # Draw each track
+            for i, track in enumerate(self.music_tracks):
+                track_y = y_offset + i * track_height
+                
+                # Calculate start and end in pixels
+                start_px = self.seconds_to_pixels(track.start_time_in_compilation) - self.scroll_offset
+                duration = track.duration or (track.total_duration - track.start_time_in_track)
+                end_px = start_px + self.seconds_to_pixels(duration)
+                
+                # Draw track if visible
+                if end_px >= 0 and start_px < width:
+                    # Draw track background
+                    track_rect = QRect(
+                        int(max(0, start_px)), 
+                        int(track_y), 
+                        int(min(width, end_px) - max(0, start_px)), 
+                        int(track_height)
+                    )
+                    
+                    painter.fillRect(track_rect, QColor(150, 100, 200, 180))  # Purple for music
+                    
+                    # Draw track name if wide enough
+                    if track_rect.width() > 60:
+                        painter.setPen(QColor(255, 255, 255))
+                        track_name = os.path.basename(track.file_path)
+                        name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_rect.width() - 10)
+                        painter.drawText(
+                            track_rect.x() + 5, 
+                            track_rect.y() + track_height / 2 + 5, 
+                            name
+                        )
+
+        # Draw current position marker
+        if self.total_duration > 0 and 0 <= self.current_position <= self.total_duration:
+            pos_x = int(self.current_position * pixels_per_second) - int(self.scroll_offset)
+
+            if 0 <= pos_x <= width:
+                painter.setPen(QPen(QColor(255, 0, 0), 2))
+                painter.drawLine(pos_x, 0, pos_x, height)
+
+                # Draw position time
+                position_text = self.format_time(self.current_position)
+
+                # Position text background
+                text_width = 80
+                painter.fillRect(pos_x - text_width // 2, 2, text_width, 20, QColor(0, 0, 0, 180))
+
+                painter.setPen(QColor(255, 0, 0))
+                painter.drawText(pos_x - text_width // 2, 2, text_width, 20, Qt.AlignCenter, position_text)
+
+        # Draw pending changes indicator
+        if self.has_pending_changes:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 0, 0, 180))
+            painter.drawRect(width - 15, 5, 10, 10)
+            
+        # Draw zoom level indicator
+        zoom_text = f"Zoom: {self.zoom_level:.1f}x"
+        painter.setPen(QColor(200, 200, 200))
+        painter.drawText(width - 100, 20, zoom_text)
+
+    def draw_time_markers(self, painter, width, height, pixels_per_second):
+        """Draw time markers and grid lines"""
+        # Determine appropriate interval for time markers based on zoom
+        if pixels_per_second > 200:
+            # Very zoomed in - show 1 second intervals
+            interval = 1
+        elif pixels_per_second > 100:
+            # Moderately zoomed in - show 5 second intervals
+            interval = 5
+        elif pixels_per_second > 50:
+            # Normal zoom - show 10 second intervals
+            interval = 10
+        elif pixels_per_second > 20:
+            # Zoomed out - show 30 second intervals
+            interval = 30
+        else:
+            # Very zoomed out - show minute intervals
+            interval = 60
+
+        # Calculate visible time range
+        start_time = max(0, self.pixels_to_seconds(self.scroll_offset))
+        end_time = self.pixels_to_seconds(self.scroll_offset + width)
+
+        # Round start time down to nearest interval
+        start_time = (start_time // interval) * interval
+
+        # Draw markers
+        painter.setPen(QPen(QColor(100, 100, 100), 1, Qt.DotLine))
+
+        for t in range(int(start_time), int(end_time) + interval, interval):
+            x = int(t * pixels_per_second) - int(self.scroll_offset)
+
+            # Draw vertical line
+            painter.drawLine(x, 0, x, height)
+
+            # Draw time label
+            time_str = self.format_time(t)
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(x + 2, height - 2, time_str)
+            painter.setPen(QPen(QColor(100, 100, 100), 1, Qt.DotLine))
+
+
+class VideoEffect:
+    """Class representing a video effect to be applied to a media item"""
+
+    def __init__(self, effect_type="none", parameters=None):
+        self.effect_type = effect_type  # Type of effect (speed, filter, etc.)
+        self.parameters = parameters or {}  # Parameters specific to the effect
+
+    def get_ffmpeg_filter(self):
+        """Get the ffmpeg filter string for this effect"""
+        if self.effect_type == "none":
+            return ""
+
+        if self.effect_type == "speed":
+            # Speed adjustment
+            speed_factor = self.parameters.get("factor", 1.0)
+            if speed_factor == 1.0:
+                return ""
+
+            # For speed adjustments, audio and video need different treatments
+            if speed_factor > 1.0:
+                # Faster playback (speed up)
+                return f"setpts={1/speed_factor}*PTS,atempo={min(2.0, speed_factor)}"
+            else:
+                # Slower playback (slow down)
+                return f"setpts={1/speed_factor}*PTS,atempo={max(0.5, speed_factor)}"
+
+        elif self.effect_type == "filter":
+            # Visual filter
+            filter_name = self.parameters.get("name", "")
+
+            if filter_name == "grayscale":
+                return "hue=s=0"
+            elif filter_name == "sepia":
+                return (
+                    "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131"
+                )
+            elif filter_name == "vignette":
+                return "vignette=PI/4"
+            elif filter_name == "blur":
+                blur_amount = self.parameters.get("amount", 5)
+                return f"boxblur={blur_amount}:1"
+            elif filter_name == "sharpen":
+                return "unsharp=5:5:1.5:5:5:0.0"
+            elif filter_name == "noise":
+                return "noise=alls=20:allf=t"
+            elif filter_name == "contrast":
+                contrast = self.parameters.get("amount", 1.5)
+                return f"eq=contrast={contrast}"
+            elif filter_name == "brightness":
+                brightness = self.parameters.get("amount", 0.1)
+                return f"eq=brightness={brightness}"
+
+        elif self.effect_type == "stabilize":
+            # Video stabilization (simplified version)
+            return "vidstabtransform=smoothing=10:input=/tmp/transforms.trf"
+
+        # Default case - no filter
+        return ""
+
+
+class EffectsDialog(QDialog):
+    """Dialog for editing video effects"""
+
+    def __init__(self, parent=None, media_item=None):
+        super().__init__(parent)
+        self.media_item = media_item
+        self.setWindowTitle("Video Effects")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(400)
+
+        # Set up UI
+        layout = QVBoxLayout(self)
+
+        # Tabs for different effect categories
+        self.tabs = QTabWidget()
+
+        # Speed tab
+        speed_tab = QWidget()
+        speed_layout = QVBoxLayout(speed_tab)
+
+        speed_label = QLabel("Playback Speed:")
+        speed_layout.addWidget(speed_label)
+
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(25, 400)  # 0.25x to 4.0x
+        self.speed_slider.setValue(int(self.media_item.playback_speed * 100))
+        self.speed_slider.setTickPosition(QSlider.TicksBelow)
+        self.speed_slider.setTickInterval(25)
+
+        self.speed_value_label = QLabel(f"{self.media_item.playback_speed:.2f}x")
+        self.speed_slider.valueChanged.connect(self.update_speed_label)
+
+        speed_layout.addWidget(self.speed_slider)
+        speed_layout.addWidget(self.speed_value_label)
+
+        # Speed presets
+        presets_layout = QHBoxLayout()
+        presets = [
+            ("0.5x", 50),
+            ("0.75x", 75),
+            ("Normal (1.0x)", 100),
+            ("1.5x", 150),
+            ("2.0x", 200),
+        ]
+
+        for label, value in presets:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _, v=value: self.speed_slider.setValue(v))
+            presets_layout.addWidget(btn)
+
+        speed_layout.addLayout(presets_layout)
+        speed_layout.addStretch()
+
+        self.tabs.addTab(speed_tab, "Speed")
+
+        # Filters tab
+        filters_tab = QWidget()
+        filters_layout = QVBoxLayout(filters_tab)
+
+        filters_label = QLabel("Visual Filters:")
+        filters_layout.addWidget(filters_label)
+
+        # Filter options
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItem("None", "none")
+        self.filter_combo.addItem("Grayscale", "grayscale")
+        self.filter_combo.addItem("Sepia", "sepia")
+        self.filter_combo.addItem("Blur", "blur")
+        self.filter_combo.addItem("Sharpen", "sharpen")
+        self.filter_combo.addItem("Noise", "noise")
+        self.filter_combo.addItem("Vignette", "vignette")
+        self.filter_combo.addItem("Contrast", "contrast")
+        self.filter_combo.addItem("Brightness", "brightness")
+
+        filters_layout.addWidget(self.filter_combo)
+
+        # Apply filter button
+        apply_filter_btn = QPushButton("Apply Filter")
+        apply_filter_btn.clicked.connect(self.apply_filter)
+        filters_layout.addWidget(apply_filter_btn)
+
+        # Current filters list
+        filters_layout.addWidget(QLabel("Applied Filters:"))
+        self.filters_list = QListWidget()
+        self.filters_list.setMaximumHeight(120)
+        filters_layout.addWidget(self.filters_list)
+
+        # Remove filter button
+        remove_filter_btn = QPushButton("Remove Selected Filter")
+        remove_filter_btn.clicked.connect(self.remove_filter)
+        filters_layout.addWidget(remove_filter_btn)
+
+        # Populate current filters
+        self.update_filters_list()
+
+        self.tabs.addTab(filters_tab, "Filters")
+
+        # Add tabs to layout
+        layout.addWidget(self.tabs, 1)
+
+        # Dialog buttons
+        buttons = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.accept)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        buttons.addStretch()
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(ok_button)
+
+        layout.addLayout(buttons)
+
+    def update_speed_label(self, value):
+        """Update the speed label when the slider changes"""
+        speed = value / 100.0
+        self.speed_value_label.setText(f"{speed:.2f}x")
+
+    def update_filters_list(self):
+        """Update the list of applied filters"""
+        self.filters_list.clear()
+        for effect in self.media_item.effects:
+            if effect.effect_type == "filter":
+                filter_name = effect.parameters.get("name", "unknown")
+                self.filters_list.addItem(filter_name.capitalize())
+
+    def apply_filter(self):
+        """Apply the selected filter"""
+        filter_type = self.filter_combo.currentData()
+
+        if filter_type == "none":
+            return
+
+        # Create filter parameters
+        parameters = {"name": filter_type}
+
+        # Create the effect
+        effect = VideoEffect("filter", parameters)
+
+        # Add the new effect
+        self.media_item.effects.append(effect)
+        
+        # Mark item as having pending changes
+        self.media_item.has_pending_changes = True
+
+        # Update the list
+        self.update_filters_list()
+
+    def remove_filter(self):
+        """Remove the selected filter"""
+        selected_items = self.filters_list.selectedItems()
+        if not selected_items:
+            return
+
+        filter_name = selected_items[0].text().lower()
+
+        # Find and remove the filter
+        for i, effect in enumerate(self.media_item.effects):
+            if (
+                effect.effect_type == "filter"
+                and effect.parameters.get("name", "") == filter_name
+            ):
+                self.media_item.effects.pop(i)
+                # Mark item as having pending changes
+                self.media_item.has_pending_changes = True
+                break
+
+        # Update the list
+        self.update_filters_list()
+
+    def accept(self):
+        """Apply changes and close dialog"""
+        # Update the playback speed
+        new_speed = self.speed_slider.value() / 100.0
+        if new_speed != self.media_item.playback_speed:
+            self.media_item.playback_speed = new_speed
+            self.media_item.has_pending_changes = True
+
+        # Invalid preview since effects changed
+        if self.media_item.has_pending_changes:
+            self.media_item.invalidate_preview()
+
+        super().accept()
+
+
+class MusicTrack:
+    """Class representing a music track in the compilation"""
+
+    def __init__(
+        self,
+        file_path,
+        start_time_in_compilation=0.0,
+        start_time_in_track=0.0,
+        duration=None,
+        volume=0.7,
+    ):
+        self.file_path = file_path
+        self.start_time_in_compilation = (
+            start_time_in_compilation  # When to start playing in the video
+        )
+        self.start_time_in_track = (
+            start_time_in_track  # Where to start playing from the music file
+        )
+        self.duration = duration  # How long to play the music (None = play until the end or until the video ends)
+        self.volume = volume  # Volume level (0.0 to 1.0)
+        self.track_id = str(uuid.uuid4())[:8]  # Unique ID for this track
+
+        # Get total duration of the music file
+        try:
+            cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                self.file_path,
+            ]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise ValueError(f"ffprobe failed: {result.stderr}")
+
+            probe = json.loads(result.stdout)
+            self.total_duration = float(probe["format"]["duration"])
+
+            # If duration is None, use the full track length
+            if self.duration is None:
+                self.duration = self.total_duration - self.start_time_in_track
+        except Exception as e:
+            print(f"Error getting music duration: {str(e)}")
+            self.total_duration = 0
+            self.duration = 0
+
+
+class MusicEditorDialog(QDialog):
+    """Dialog for managing multiple music tracks"""
+
+    def __init__(self, parent=None, music_tracks=None, total_video_duration=0):
+        super().__init__(parent)
+        self.setWindowTitle("Music Editor")
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(400)
+
+        # Store data
+        self.music_tracks = music_tracks.copy() if music_tracks else []
+        self.total_video_duration = total_video_duration
+        self.original_tracks = music_tracks.copy() if music_tracks else []
+        self.changes_made = False
+
+        # Initialize UI
+        layout = QVBoxLayout(self)
+
+        # Table for music tracks
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "File",
+                "Start In Video",
+                "Start In Track",
+                "Duration",
+                "Volume",
+                "End Time",
+                "Actions",
+            ]
+        )
+
+        # Set column widths
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 6):
+            self.table.horizontalHeader().setSectionResizeMode(
+                i, QHeaderView.ResizeToContents
+            )
+
+        layout.addWidget(self.table)
+
+        # Timeline visualization
+        timeline_label = QLabel("Music Timeline:")
+        timeline_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(timeline_label)
+
+        self.timeline_widget = QWidget()
+        self.timeline_widget.setMinimumHeight(60)
+        self.timeline_widget.setMaximumHeight(120)
+        self.timeline_widget.paintEvent = self.paint_timeline
+        layout.addWidget(self.timeline_widget)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        add_button = QPushButton("Add Music Track")
+        add_button.clicked.connect(self.add_track)
+
+        self.ok_button = QPushButton("OK")
+        self.ok_button.clicked.connect(self.accept)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+
+        button_layout.addWidget(add_button)
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_button)
+        button_layout.addWidget(self.ok_button)
+
+        layout.addLayout(button_layout)
+
+        # Populate table
+        self.populate_table()
+
+    def paint_timeline(self, event):
+        """Paint the music timeline visualization"""
+        if not self.music_tracks or self.total_video_duration <= 0:
+            return
+
+        painter = QPainter(self.timeline_widget)
+        painter.setRenderHint(QPainter.Antialiasing)
+        width = self.timeline_widget.width()
+        height = self.timeline_widget.height()
+
+        # Draw background
+        painter.fillRect(0, 0, width, height, QColor(40, 40, 40))
+
+        # Draw time markers
+        painter.setPen(QPen(QColor(100, 100, 100), 1, Qt.DotLine))
+        interval = max(1, int(self.total_video_duration / 10))  # Divide into ~10 segments
+
+        for t in range(0, int(self.total_video_duration) + interval, interval):
+            x = int((t / self.total_video_duration) * width)
+            painter.drawLine(x, 0, x, height)
+            
+            # Draw time label
+            minutes = t // 60
+            seconds = t % 60
+            time_str = f"{minutes}:{seconds:02d}"
+            painter.setPen(QColor(200, 200, 200))
+            painter.drawText(x + 5, 15, time_str)
+            painter.setPen(QPen(QColor(100, 100, 100), 1, Qt.DotLine))
+
+        # Draw tracks
+        track_height = min(height / max(1, len(self.music_tracks)), 25)
+        
+        for i, track in enumerate(self.music_tracks):
+            y = i * track_height + 20  # Start below time markers
+            
+            # Calculate track position
+            start_x = int((track.start_time_in_compilation / self.total_video_duration) * width)
+            # Calculate duration - either specified or remainder of track
+            if track.duration:
+                duration = track.duration
+            else:
+                duration = track.total_duration - track.start_time_in_track
+            end_x = int(((track.start_time_in_compilation + duration) / self.total_video_duration) * width)
+            end_x = min(end_x, width)
+            
+            # Draw track block
+            track_width = max(2, end_x - start_x)
+            track_rect = QRect(start_x, y, track_width, track_height - 2)
+            
+            # Color based on volume
+            color_intensity = int(155 + track.volume * 100)
+            track_color = QColor(100, color_intensity, 200, 180)
+            
+            painter.fillRect(track_rect, track_color)
+            
+            # Draw border
+            painter.setPen(QPen(QColor(200, 200, 200)))
+            painter.drawRect(track_rect)
+            
+            # Draw track name if there's room
+            if track_width > 60:
+                track_name = os.path.basename(track.file_path)
+                name = painter.fontMetrics().elidedText(track_name, Qt.ElideMiddle, track_width - 10)
+                painter.drawText(track_rect.x() + 5, track_rect.y() + track_height / 2 + 5, name)
+
+    def populate_table(self):
+        """Populate the table with music tracks"""
+        self.table.setRowCount(0)
+
+        for i, track in enumerate(self.music_tracks):
+            self.table.insertRow(i)
+
+            # File name
+            self.table.setItem(
+                i, 0, QTableWidgetItem(os.path.basename(track.file_path))
+            )
+
+            # Start in video
+            start_in_video = QDoubleSpinBox()
+            start_in_video.setRange(0, max(self.total_video_duration, 3600))
+            start_in_video.setValue(track.start_time_in_compilation)
+            start_in_video.setSuffix(" sec")
+            start_in_video.valueChanged.connect(
+                lambda value, row=i: self.update_track(row, "start_comp", value)
+            )
+            self.table.setCellWidget(i, 1, start_in_video)
+
+            # Start in track
+            start_in_track = QDoubleSpinBox()
+            start_in_track.setRange(0, track.total_duration)
+            start_in_track.setValue(track.start_time_in_track)
+            start_in_track.setSuffix(" sec")
+            start_in_track.valueChanged.connect(
+                lambda value, row=i: self.update_track(row, "start_track", value)
+            )
+            self.table.setCellWidget(i, 2, start_in_track)
+
+            # Duration
+            duration_spin = QDoubleSpinBox()
+            duration_spin.setRange(0.1, 3600)
+            if track.duration:
+                duration_spin.setValue(track.duration)
+            else:
+                duration_spin.setValue(track.total_duration - track.start_time_in_track)
+            duration_spin.setSuffix(" sec")
+            duration_spin.valueChanged.connect(
+                lambda value, row=i: self.update_track(row, "duration", value)
+            )
+            self.table.setCellWidget(i, 3, duration_spin)
+
+            # Volume
+            volume_spin = QDoubleSpinBox()
+            volume_spin.setRange(0, 1)
+            volume_spin.setSingleStep(0.1)
+            volume_spin.setDecimals(1)
+            volume_spin.setValue(track.volume)
+            volume_spin.valueChanged.connect(
+                lambda value, row=i: self.update_track(row, "volume", value)
+            )
+            self.table.setCellWidget(i, 4, volume_spin)
+
+            # End time (calculated)
+            end_time = track.start_time_in_compilation + (
+                track.duration or (track.total_duration - track.start_time_in_track)
+            )
+            end_time_item = QTableWidgetItem(f"{end_time:.2f} sec")
+            end_time_item.setFlags(end_time_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(i, 5, end_time_item)
+
+            # Actions button
+            actions_layout = QHBoxLayout()
+            actions_layout.setContentsMargins(0, 0, 0, 0)
+
+            delete_btn = QPushButton("Delete")
+            delete_btn.setStyleSheet("background-color: #e74c3c; color: white;")
+            delete_btn.clicked.connect(lambda _, row=i: self.delete_track(row))
+
+            actions_layout.addWidget(delete_btn)
+
+            actions_widget = QWidget()
+            actions_widget.setLayout(actions_layout)
+            self.table.setCellWidget(i, 6, actions_widget)
+
+    def update_track(self, row, property_name, value):
+        """Update a track property and refresh calculations"""
+        if 0 <= row < len(self.music_tracks):
+            track = self.music_tracks[row]
+            self.changes_made = True
+
+            if property_name == "start_comp":
+                track.start_time_in_compilation = value
+            elif property_name == "start_track":
+                track.start_time_in_track = value
+                # Update max possible duration
+                max_duration = track.total_duration - track.start_time_in_track
+                duration_widget = self.table.cellWidget(row, 3)
+                if duration_widget and isinstance(duration_widget, QDoubleSpinBox):
+                    if duration_widget.value() > max_duration:
+                        duration_widget.setValue(max_duration)
+                    duration_widget.setMaximum(max_duration)
+            elif property_name == "duration":
+                track.duration = value
+            elif property_name == "volume":
+                track.volume = value
+
+            # Update end time
+            end_time = track.start_time_in_compilation + (
+                track.duration or (track.total_duration - track.start_time_in_track)
+            )
+            self.table.item(row, 5).setText(f"{end_time:.2f} sec")
+            
+            # Update timeline
+            self.timeline_widget.update()
+
+    def add_track(self):
+        """Add a new music track"""
+        music_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Music File",
+            "",
+            "Audio Files (*.mp3 *.wav *.ogg *.aac *.m4a *.flac)",
+        )
+
+        if not music_path:
+            return
+
+        # Get the estimated total duration of the video
+        # If there are existing tracks, suggest starting after the last one
+        start_time = 0
+        if self.music_tracks:
+            last_track = self.music_tracks[-1]
+            last_end = last_track.start_time_in_compilation + (
+                last_track.duration
+                or (last_track.total_duration - last_track.start_time_in_track)
+            )
+            start_time = max(0, last_end)
+
+        # Create a new track
+        new_track = MusicTrack(music_path, start_time_in_compilation=start_time)
+        self.music_tracks.append(new_track)
+        self.changes_made = True
+
+        # Refresh the table
+        self.populate_table()
+        
+        # Update timeline
+        self.timeline_widget.update()
+
+    def delete_track(self, row):
+        """Delete a music track"""
+        if 0 <= row < len(self.music_tracks):
+            del self.music_tracks[row]
+            self.changes_made = True
+            self.populate_table()
+            
+            # Update timeline
+            self.timeline_widget.update()
+
+    def accept(self):
+        """Apply changes and return"""
+        if self.changes_made:
+            # Mark that there are pending changes that need to be re-rendered
+            result = QMessageBox.information(
+                self,
+                "Music Changes",
+                "Music changes will be applied when you preview or export the video.",
+                QMessageBox.Ok
+            ),
+        super().accept()
+
+    def reject(self):
+        """Cancel and discard changes"""
+        if self.changes_made:
+            result = QMessageBox.question(
+                self,
+                "Discard Changes",
+                "You have made changes to the music tracks. Discard these changes?",
+                QMessageBox.Yes | QMessageBox.No
+            ),
+            if result == QMessageBox.Yes:
+                # Restore original tracks
+                self.music_tracks.clear()
+                self.music_tracks.extend(self.original_tracks)
+                super().reject()
+            # Otherwise do nothing - stay in the dialog
+        else:
+            super().reject()
+
+
 class VideoCompilationEditor(QMainWindow):
     def __init__(self):
         super().__init__()
-        
+
         # Clean up any old temp files
         cleanup_temp_dirs()
-        
+
         # Setup media player for previews
         self.media_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.video_widget = QVideoWidget()
@@ -1319,7 +3091,7 @@ class VideoCompilationEditor(QMainWindow):
         self.media_player.positionChanged.connect(self.position_changed)
         self.media_player.durationChanged.connect(self.duration_changed)
         self.media_player.error.connect(self.handle_player_error)
-        
+
         # Track state
         self.preview_file = None
         self.current_item = None
@@ -1327,24 +3099,34 @@ class VideoCompilationEditor(QMainWindow):
         self.position_slider_being_dragged = False
         self.progress_dialog = None
         self.is_processing = False
-        
+
+        # Preview all cache
+        self.preview_all_cache = {"signature": None, "path": None, "total_duration": 0}
+
+        # Background music
+        self.music_file = None  # Keep for backward compatibility
+        self.music_volume = 0.7  # Default 70% volume
+        self.music_tracks = []  # List of MusicTrack objects
+        self.has_pending_music_changes = False  # Flag for music changes
+
         # Create processing thread
         self.processing_thread = ProcessingThread(self)
         self.processing_thread.progress.connect(self.update_progress)
         self.processing_thread.finished.connect(self.processing_finished)
         self.processing_thread.error.connect(self.processing_error)
-        
+
         # Initialize UI
         self.setup_ui()
-        
+
     def setup_ui(self):
         """Set up the user interface"""
         self.setWindowTitle("Video Compilation Editor")
         self.setGeometry(100, 100, 1200, 720)
         self.setMinimumSize(900, 600)
-        
+
         # Apply professional styling
-        self.setStyleSheet("""
+        self.setStyleSheet(
+            """
             QMainWindow, QDialog {
                 background-color: #f5f5f5;
             }
@@ -1423,162 +3205,231 @@ class VideoCompilationEditor(QMainWindow):
             QProgressDialog QPushButton {
                 background-color: #e74c3c;
             }
-        """)
-        
+        """
+        )
+
         # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         # Main layout
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
-        
+
         # Top toolbar
         toolbar = QHBoxLayout()
-        
+
         # Add files buttons
         add_videos_btn = QPushButton("Add Videos")
         add_videos_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogStart))
         add_videos_btn.clicked.connect(self.add_videos)
-        
+
         add_images_btn = QPushButton("Add Images")
         add_images_btn.setIcon(self.style().standardIcon(QStyle.SP_DirIcon))
         add_images_btn.clicked.connect(self.add_images)
-        
+
         toolbar.addWidget(add_videos_btn)
         toolbar.addWidget(add_images_btn)
-        
+
         # Clip management buttons
         edit_btn = QPushButton("Edit")
         edit_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
         edit_btn.clicked.connect(self.edit_selected)
-        
+
         delete_btn = QPushButton("Remove")
         delete_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         delete_btn.clicked.connect(self.delete_selected)
-        
+
         randomize_btn = QPushButton("Shuffle")
         randomize_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
         randomize_btn.clicked.connect(self.randomize_order)
-        
+
         toolbar.addWidget(edit_btn)
         toolbar.addWidget(delete_btn)
         toolbar.addWidget(randomize_btn)
-        
-        # Export button 
+
+        # Export button
         toolbar.addStretch()
-        
+
+        # Add Music button
+        add_music_btn = QPushButton("Add Music")
+        add_music_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolume))
+        add_music_btn.clicked.connect(self.add_music)
+        toolbar.addWidget(add_music_btn)
+
         preview_all_btn = QPushButton("Preview All")
         preview_all_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         preview_all_btn.clicked.connect(self.preview_all)
-        
+
         export_btn = QPushButton("Export")
         export_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
         export_btn.clicked.connect(self.export)
-        
+
         toolbar.addWidget(preview_all_btn)
         toolbar.addWidget(export_btn)
-        
+
         main_layout.addLayout(toolbar)
-        
+
         # Main content splitter
         splitter = QSplitter(Qt.Horizontal)
-        
+
         # Left panel - media list
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Media list header
         list_label = QLabel("Media Items")
         list_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         left_layout.addWidget(list_label)
-        
+
         # Media list
         self.clip_list = QListWidget()
         self.clip_list.setDragDropMode(QAbstractItemView.InternalMove)
         self.clip_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.clip_list.itemSelectionChanged.connect(self.selection_changed)
         self.clip_list.itemDoubleClicked.connect(self.edit_selected)
+        self.clip_list.model().rowsMoved.connect(self.on_items_reordered)
         left_layout.addWidget(self.clip_list)
-        
+
         # Preview button for selected item
         preview_btn = QPushButton("Preview Selected")
         preview_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         preview_btn.clicked.connect(self.preview_selected_item)
         left_layout.addWidget(preview_btn)
-        
+
         # Right panel - preview
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         # Preview section
         preview_label = QLabel("Preview")
         preview_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         right_layout.addWidget(preview_label)
-        
+
         # Add video widget
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_layout.addWidget(self.video_widget)
-        
+
         # Playback controls
         playback_layout = QHBoxLayout()
-        
+
         # Play button
         self.play_button = QToolButton()
         self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.play_button.setIconSize(QSize(24, 24))
         self.play_button.setFixedSize(36, 36)
         self.play_button.clicked.connect(self.play_pause)
-        
+
         # Stop button
         self.stop_button = QToolButton()
         self.stop_button.setIcon(self.style().standardIcon(QStyle.SP_MediaStop))
         self.stop_button.setIconSize(QSize(24, 24))
         self.stop_button.setFixedSize(36, 36)
         self.stop_button.clicked.connect(self.stop)
-        
+
         # Position slider
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setRange(0, 0)
         self.position_slider.sliderMoved.connect(self.set_position)
         self.position_slider.sliderPressed.connect(self.slider_pressed)
         self.position_slider.sliderReleased.connect(self.slider_released)
-        
+
         # Time label
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.time_label.setMinimumWidth(80)
-        
+
         # Add to layout
         playback_layout.addWidget(self.play_button)
         playback_layout.addWidget(self.stop_button)
         playback_layout.addWidget(self.position_slider)
         playback_layout.addWidget(self.time_label)
-        
+
         right_layout.addLayout(playback_layout)
+
+        # Add timeline widget for visualization
+        timeline_header = QHBoxLayout()
+        timeline_label = QLabel("Timeline:")
+        timeline_label.setStyleSheet("font-weight: bold; font-size: 14px;")
         
+        timeline_help = QLabel("(Drag to scroll, Ctrl+Wheel to zoom)")
+        timeline_help.setStyleSheet("font-size: 10px; color: #888;")
+        
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedWidth(30)
+        zoom_out_btn.setToolTip("Zoom Out")
+        zoom_out_btn.clicked.connect(self.zoom_out_timeline)
+        
+        zoom_fit_btn = QPushButton("Fit")
+        zoom_fit_btn.setFixedWidth(40)
+        zoom_fit_btn.setToolTip("Fit to View")
+        zoom_fit_btn.clicked.connect(self.zoom_fit_timeline)
+        
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedWidth(30)
+        zoom_in_btn.setToolTip("Zoom In")
+        zoom_in_btn.clicked.connect(self.zoom_in_timeline)
+        
+        timeline_header.addWidget(timeline_label)
+        timeline_header.addWidget(timeline_help)
+        timeline_header.addStretch()
+        timeline_header.addWidget(zoom_out_btn)
+        timeline_header.addWidget(zoom_fit_btn)
+        timeline_header.addWidget(zoom_in_btn)
+        
+        right_layout.addLayout(timeline_header)
+
+        self.timeline = TimelineWidget()
+        right_layout.addWidget(self.timeline)
+
         # Add panels to splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([300, 700])
-        
+
         main_layout.addWidget(splitter, 1)
-        
+
         # Status bar
         status_frame = QFrame()
         status_frame.setObjectName("statusFrame")
         status_layout = QHBoxLayout(status_frame)
         status_layout.setContentsMargins(10, 5, 10, 5)
-        
+
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("font-weight: bold;")
         status_layout.addWidget(self.status_label)
         
+        # Changes indicator
+        self.changes_indicator = QLabel("")
+        self.changes_indicator.setStyleSheet("color: #e74c3c;")
+        status_layout.addWidget(self.changes_indicator, 0, Qt.AlignRight)
+
         main_layout.addWidget(status_frame)
-    
+
+    def zoom_in_timeline(self):
+        """Zoom in on the timeline"""
+        self.timeline.zoom_level = min(10.0, self.timeline.zoom_level * 1.25)
+        self.timeline.update()
+
+    def zoom_out_timeline(self):
+        """Zoom out on the timeline"""
+        self.timeline.zoom_level = max(0.1, self.timeline.zoom_level / 1.25)
+        self.timeline.update()
+
+    def zoom_fit_timeline(self):
+        """Reset zoom to fit all clips in view"""
+        self.timeline.zoom_level = 1.0
+        self.timeline.scroll_offset = 0
+        self.timeline.update()
+
+    def on_items_reordered(self):
+        """Handle list reordering event"""
+        self.update_timeline()
+        self.preview_all_cache["signature"] = None  # Invalidate preview cache
+
     def cancel_processing(self):
         """Cancel the current processing operation"""
         if self.processing_thread.isRunning():
@@ -1591,46 +3442,57 @@ class VideoCompilationEditor(QMainWindow):
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
         else:
             self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-    
+
     def play_pause(self):
         """Toggle play/pause state"""
         if self.media_player.state() == QMediaPlayer.PlayingState:
             self.media_player.pause()
         else:
             self.media_player.play()
-    
+
     def stop(self):
         """Stop playback"""
         self.media_player.stop()
-    
+
     def position_changed(self, position):
         """Update position slider and time label"""
         if not self.position_slider_being_dragged:
             self.position_slider.setValue(position)
-        
+
         duration = self.media_player.duration()
         if duration > 0:
             position_sec = position / 1000.0
             duration_sec = duration / 1000.0
-            self.time_label.setText(f"{int(position_sec // 60)}:{int(position_sec % 60):02d} / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}")
-    
+            self.time_label.setText(
+                f"{int(position_sec // 60)}:{int(position_sec % 60):02d} / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}"
+            )
+
+            # Update timeline position
+            self.timeline.set_position(position_sec)
+            self.timeline.update()
+
     def duration_changed(self, duration):
         """Update slider range when media duration changes"""
         self.position_slider.setRange(0, duration)
-    
+        
+        # Set the time label with correct total time
+        if duration > 0:
+            duration_sec = duration / 1000.0
+            self.time_label.setText(f"0:00 / {int(duration_sec // 60)}:{int(duration_sec % 60):02d}")
+
     def set_position(self, position):
         """Set media position from slider"""
         self.media_player.setPosition(position)
-    
+
     def slider_pressed(self):
         """Handle slider press event"""
         self.position_slider_being_dragged = True
-    
+
     def slider_released(self):
         """Handle slider release event"""
         self.position_slider_being_dragged = False
         self.media_player.setPosition(self.position_slider.value())
-        
+
     def handle_player_error(self, error):
         """Handle media player errors"""
         if error != QMediaPlayer.NoError:
@@ -1639,56 +3501,147 @@ class VideoCompilationEditor(QMainWindow):
 
     def update_progress(self, value, message):
         """Update progress dialog"""
-        if self.progress_dialog:
-            self.progress_dialog.setValue(value)
-            self.progress_dialog.setLabelText(message)
+        if self.progress_dialog is not None:
+            try:
+                self.progress_dialog.setValue(value)
+                self.progress_dialog.setLabelText(message)
+            except:
+                # Handle case where dialog might be closed during update
+                pass
+
+
+    def check_pending_changes(self):
+        """Check for pending changes and update UI indicators"""
+        has_pending_changes = False
+        
+        # Check all media items
+        for i in range(self.clip_list.count()):
+            item = self.clip_list.item(i)
+            media_item = item.data(Qt.UserRole)
+            if media_item.has_pending_changes:
+                has_pending_changes = True
+                break
+        
+        # Check if music has changed since last preview/export
+        if self.has_pending_music_changes:
+            has_pending_changes = True
+        
+        # Update UI indicators
+        if has_pending_changes:
+            self.changes_indicator.setText("⚠️ Pending changes - preview to see updates")
+            self.timeline.set_pending_changes(True)
+        else:
+            self.changes_indicator.setText("")
+            self.timeline.set_pending_changes(False)
+            
+            return has_pending_changes
 
     def processing_finished(self, task, result):
         """Handle processing thread completion"""
+
+
         self.is_processing = False
-        
+
+        # Clear progress dialog safely
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except:
+                pass
+            self.progress_dialog = None
+
         # Check if it's an error or aborted
         if result == "Aborted":
             self.status_label.setText("Operation canceled")
             return
-            
+
         if isinstance(result, str) and result.startswith("Error"):
             self.status_label.setText("Operation failed")
             QMessageBox.warning(self, "Error", result)
             return
-            
+
         # Success cases - check task
         if task == "preview_item":
             if os.path.exists(result) and os.path.getsize(result) > 1000:
                 # Valid preview file
                 self.preview_file = result
-                self.status_label.setText(f"Playing: {os.path.basename(self.current_item.file_path)}")
+                self.status_label.setText(
+                    f"Playing: {os.path.basename(self.current_item.file_path)}"
+                )
                 self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result)))
                 self.media_player.play()
+                
+                # Clear pending changes flag for this item
+                self.current_item.has_pending_changes = False
+                self.check_pending_changes()
             else:
                 self.status_label.setText("Preview failed - invalid output file")
-        
+
         elif task == "preview_all":
-            if os.path.exists(result) and os.path.getsize(result) > 1000:
+            # For preview_all, result is a tuple (file_path, duration)
+            output_file = result
+            if isinstance(result, tuple) and len(result) == 2:
+                output_file = result[0]
+
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 1000:
                 # Valid preview file
-                self.preview_file = result
+                self.preview_file = output_file
                 self.status_label.setText("Playing: All items")
-                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(result)))
+                self.media_player.setMedia(
+                    QMediaContent(QUrl.fromLocalFile(output_file))
+                )
                 self.media_player.play()
+                
+                # Clear all pending changes flags
+                for i in range(self.clip_list.count()):
+                    item = self.clip_list.item(i)
+                    media_item = item.data(Qt.UserRole)
+                    media_item.has_pending_changes = False
+                
+                # Clear music changes flag too
+                self.has_pending_music_changes = False
+                
+                # Update change indicators
+                self.check_pending_changes()
             else:
                 self.status_label.setText("Preview failed - invalid output file")
-        
+
         elif task == "export":
             if os.path.exists(result) and os.path.getsize(result) > 1000:
                 # Valid export file
                 self.status_label.setText("Export completed successfully")
-                QMessageBox.information(self, "Export Complete", f"The compilation has been saved to:\n{result}")
+                QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"The compilation has been saved to:\n{result}",
+                )
+                
+                # Clear all pending changes flags
+                for i in range(self.clip_list.count()):
+                    item = self.clip_list.item(i)
+                    media_item = item.data(Qt.UserRole)
+                    media_item.has_pending_changes = False
+                
+                # Clear music changes flag too
+                self.has_pending_music_changes = False
+                
+                # Update change indicators
+                self.check_pending_changes()
             else:
                 self.status_label.setText("Export failed - invalid output file")
-    
+
     def processing_error(self, task, error_msg):
         """Handle processing thread error"""
         self.is_processing = False
+        
+        # Clear progress dialog safely
+        if self.progress_dialog:
+            try:
+                self.progress_dialog.close()
+            except:
+                pass
+            self.progress_dialog = None
+            
         self.status_label.setText(f"Error during {task}: {error_msg}")
         QMessageBox.warning(self, "Error", f"An error occurred: {error_msg}")
 
@@ -1698,59 +3651,61 @@ class VideoCompilationEditor(QMainWindow):
             if platform.system() == "Windows":
                 os.startfile(video_file)
             elif platform.system() == "Darwin":  # macOS
-                subprocess.call(('open', video_file))
+                subprocess.call(("open", video_file))
             else:  # Linux
                 # Try different players
-                if shutil.which('vlc'):
-                    subprocess.Popen(['vlc', video_file])
-                elif shutil.which('mpv'):
-                    subprocess.Popen(['mpv', video_file])
+                if shutil.which("vlc"):
+                    subprocess.Popen(["vlc", video_file])
+                elif shutil.which("mpv"):
+                    subprocess.Popen(["mpv", video_file])
                 else:
-                    subprocess.call(('xdg-open', video_file))
+                    subprocess.call(("xdg-open", video_file))
             return True
         except Exception as e:
             print(f"Error launching external player: {e}")
             return False
-    
+
     def closeEvent(self, event):
         """Handle window close event"""
         # Stop any media playback
         self.media_player.stop()
-        
+
         # Stop processing thread if running
         if self.processing_thread.isRunning():
             self.processing_thread.abort()
             self.processing_thread.wait()
-        
+
         # Clean up temp files
         cleanup_temp_dirs()
-        
+
         # Accept the event
         event.accept()
-    
+
     def add_videos(self):
         """Add video files to the compilation"""
         files, _ = QFileDialog.getOpenFileNames(
-            self, 
-            "Select Videos", 
-            "", 
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.m4v *.webm)"
+            self,
+            "Select Videos",
+            "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.m4v *.webm)",
         )
-        
+
         if not files:
             return
-            
+
         # Show progress dialog for large imports
         if len(files) > 3:
-            progress = QProgressDialog("Importing videos...", "Cancel", 0, len(files), self)
+            progress = QProgressDialog(
+                "Importing videos...", "Cancel", 0, len(files), self
+            )
             progress.setWindowTitle("Importing")
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
         else:
             progress = None
-            
+
         failed_files = []
-        
+
         for i, file_path in enumerate(files):
             if progress:
                 progress.setValue(i)
@@ -1758,7 +3713,7 @@ class VideoCompilationEditor(QMainWindow):
                 QApplication.processEvents()
                 if progress.wasCanceled():
                     break
-                
+
             try:
                 clip = VideoClip(file_path)
                 item = QListWidgetItem(os.path.basename(file_path))
@@ -1766,57 +3721,67 @@ class VideoCompilationEditor(QMainWindow):
                 self.clip_list.addItem(item)
             except ValueError as e:
                 failed_files.append(f"{os.path.basename(file_path)}: {str(e)}")
-                
+
         if progress:
             progress.setValue(len(files))
-            
+
         # Show any errors
         if failed_files:
-            error_msg = "The following files could not be imported:\n\n" + "\n".join(failed_files[:5])
+            error_msg = "The following files could not be imported:\n\n" + "\n".join(
+                failed_files[:5]
+            )
             if len(failed_files) > 5:
                 error_msg += f"\n\n...and {len(failed_files) - 5} more"
             QMessageBox.warning(self, "Import Errors", error_msg)
-            
+
         # Update status
         if len(files) > len(failed_files):
             self.status_label.setText(f"Added {len(files) - len(failed_files)} videos")
-            
+
             # Select the first added item
             if self.clip_list.count() > 0:
                 self.clip_list.setCurrentRow(0)
-    
+
+            # Update timeline
+            self.update_timeline()
+            
+            # Invalidate preview cache
+            self.preview_all_cache["signature"] = None
+
     def add_images(self):
         """Add image files to the compilation"""
         files, _ = QFileDialog.getOpenFileNames(
-            self, 
-            "Select Images", 
-            "", 
-            "Image Files (*.jpg *.jpeg *.png *.bmp *.gif *.webp)"
+            self,
+            "Select Images",
+            "",
+            "Image Files (*.jpg *.jpeg *.png *.bmp *.gif *.webp)",
         )
-        
+
         if not files:
             return
-            
+
         # Ask for duration
         dialog = ImageDurationDialog(self, self.default_image_duration)
         if not dialog.exec_():
             return
-            
+
         duration = dialog.duration_spin.value()
         apply_to_all = dialog.apply_to_all.isChecked()
         self.default_image_duration = duration
-        
+
         # Show progress dialog for large imports
         if len(files) > 3:
-            progress = QProgressDialog("Importing images...", "Cancel", 0, len(files), self)
+            progress = QProgressDialog(
+                "Importing images...", "Cancel", 0, len(files), self
+            )
             progress.setWindowTitle("Importing")
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
         else:
             progress = None
-            
+
         failed_files = []
-        
+
         for i, file_path in enumerate(files):
             if progress:
                 progress.setValue(i)
@@ -1824,241 +3789,479 @@ class VideoCompilationEditor(QMainWindow):
                 QApplication.processEvents()
                 if progress.wasCanceled():
                     break
-                
+
             try:
                 image = ImageItem(file_path)
                 if apply_to_all:
                     image.display_duration = duration
                     image.duration = duration
                     image.end_time = duration
-                
+
                 item = QListWidgetItem(os.path.basename(file_path))
                 item.setData(Qt.UserRole, image)
                 self.clip_list.addItem(item)
             except ValueError as e:
                 failed_files.append(f"{os.path.basename(file_path)}: {str(e)}")
-                
+
         if progress:
             progress.setValue(len(files))
-            
+
         # Show any errors
         if failed_files:
-            error_msg = "The following files could not be imported:\n\n" + "\n".join(failed_files[:5])
+            error_msg = "The following files could not be imported:\n\n" + "\n".join(
+                failed_files[:5]
+            )
             if len(failed_files) > 5:
                 error_msg += f"\n\n...and {len(failed_files) - 5} more"
             QMessageBox.warning(self, "Import Errors", error_msg)
-            
+
         # Update status
         if len(files) > len(failed_files):
             self.status_label.setText(f"Added {len(files) - len(failed_files)} images")
-            
+
             # Select the first added item
             if self.clip_list.count() > 0:
                 self.clip_list.setCurrentRow(0)
-    
+
+            # Update timeline
+            self.update_timeline()
+            
+            # Invalidate preview cache
+            self.preview_all_cache["signature"] = None
+
     def edit_selected(self):
         """Edit properties of the selected item"""
         if not self.current_item:
-            QMessageBox.information(self, "No Selection", "Please select a media item to edit.")
+            QMessageBox.information(
+                self, "No Selection", "Please select a media item to edit."
+            )
             return
-            
+
         # Create edit dialog
         dialog = EditDialog(self, self.current_item)
         if dialog.exec_():
             # Apply changes and invalidate preview
             self.current_item.invalidate_preview()
-            self.status_label.setText(f"Updated {os.path.basename(self.current_item.file_path)}")
-    
+            self.status_label.setText(
+                f"Updated {os.path.basename(self.current_item.file_path)}"
+            )
+
+            # Update timeline since clip duration may have changed
+            self.update_timeline()
+            
+            # Check for pending changes
+            self.check_pending_changes()
+            
+            # Invalidate preview cache
+            self.preview_all_cache["signature"] = None
+
     def randomize_order(self):
         """Shuffle the order of items in the list"""
         if self.clip_list.count() <= 1:
             return
-            
+
         # Get all items
         items = []
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
             items.append((item.text(), item.data(Qt.UserRole)))
-            
+
         # Shuffle items
         random.shuffle(items)
-        
+
         # Clear and refill list
         self.clip_list.clear()
-        
+
         for text, data in items:
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, data)
             self.clip_list.addItem(item)
-            
+
         self.status_label.setText("Items shuffled")
-    
+
+        # Update timeline
+        self.update_timeline()
+        
+        # Invalidate preview cache
+        self.preview_all_cache["signature"] = None
+
     def delete_selected(self):
         """Remove selected items from the list"""
         if not self.current_item:
-            QMessageBox.information(self, "No Selection", "Please select a media item to remove.")
+            QMessageBox.information(
+                self, "No Selection", "Please select a media item to remove."
+            )
             return
-            
+
         # Find the current item
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
             if item.data(Qt.UserRole) == self.current_item:
                 # Clean up preview if it exists
-                if self.current_item.preview_file and os.path.exists(self.current_item.preview_file):
+                if self.current_item.preview_file and os.path.exists(
+                    self.current_item.preview_file
+                ):
                     try:
                         os.unlink(self.current_item.preview_file)
                     except:
                         pass
-                        
+
                 # Remove from list
                 self.clip_list.takeItem(i)
                 self.current_item = None
                 self.status_label.setText("Item removed")
+
+                # Update timeline
+                self.update_timeline()
+                
+                # Invalidate preview cache
+                self.preview_all_cache["signature"] = None
+                
                 return
-    
+
     def selection_changed(self):
         """Handle list selection change"""
         selected_items = self.clip_list.selectedItems()
-        
+
         if selected_items:
             # Get the selected item
             self.current_item = selected_items[0].data(Qt.UserRole)
-            
+
             # Update status to show what's selected
             file_name = os.path.basename(self.current_item.file_path)
             if self.current_item.preview_status == "ready":
                 self.status_label.setText(f"Selected: {file_name} (Preview available)")
             else:
-                self.status_label.setText(f"Selected: {file_name} (Use Preview button to preview)")
+                self.status_label.setText(
+                    f"Selected: {file_name} (Use Preview button to preview)"
+                )
+            if self.timeline:
+                index = self.clip_list.currentRow()
+                if index >= 0:
+                    self.timeline.hover_clip_index = index
+                    self.timeline.update()
         else:
             self.current_item = None
             self.status_label.setText("Ready")
-    
+            
+            # Clear timeline highlight
+            if self.timeline:
+                self.timeline.hover_clip_index = -1
+                self.timeline.update()
+
     def preview_selected_item(self):
         """Preview the selected item"""
         if not self.current_item:
-            QMessageBox.information(self, "No Selection", "Please select a media item to preview.")
+            QMessageBox.information(
+                self, "No Selection", "Please select a media item to preview."
+            )
             return
-        
+
         # Check if already processing
         if self.is_processing:
-            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
+            QMessageBox.information(
+                self, "Processing", "Please wait for the current operation to complete."
+            )
             return
-        
-        # Check if preview already exists
-        if self.current_item.preview_status == "ready" and self.current_item.preview_file and os.path.exists(self.current_item.preview_file):
+
+        # Check if preview already exists and there are no pending changes
+        if (
+            not self.current_item.has_pending_changes
+            and self.current_item.preview_status == "ready"
+            and self.current_item.preview_file
+            and os.path.exists(self.current_item.preview_file)
+        ):
             # Preview exists, just play it
             self.preview_file = self.current_item.preview_file
-            self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.current_item.preview_file)))
+            self.media_player.setMedia(
+                QMediaContent(QUrl.fromLocalFile(self.current_item.preview_file))
+            )
             self.media_player.play()
-            self.status_label.setText(f"Playing: {os.path.basename(self.current_item.file_path)}")
+            self.status_label.setText(
+                f"Playing: {os.path.basename(self.current_item.file_path)}"
+            )
             return
-            
-        # No preview exists, need to create one
+
+        # No preview exists or changes pending, need to create one
         self.is_processing = True
         self.current_item.preview_status = "generating"
-        self.status_label.setText(f"Creating preview for {os.path.basename(self.current_item.file_path)}...")
-        
+        self.status_label.setText(
+            f"Creating preview for {os.path.basename(self.current_item.file_path)}..."
+        )
+
         # Create progress dialog
-        self.progress_dialog = QProgressDialog("Creating preview...", "Cancel", 0, 100, self)
+        self.progress_dialog = QProgressDialog(
+            "Creating preview...", "Cancel", 0, 100, self
+        )
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
         self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
         self.progress_dialog.setValue(0)
-        
+
         # Set up processing thread
         self.processing_thread.setup_task("preview_item", [self.current_item])
-        
+
         # Start thread
         self.processing_thread.start()
-    
+
     def preview_all(self):
         """Preview all items in the compilation"""
         # Check if we have items
         if self.clip_list.count() == 0:
-            QMessageBox.information(self, "No Items", "Please add some media items first.")
+            QMessageBox.information(
+                self, "No Items", "Please add some media items first."
+            )
             return
-            
+
         # Check if already processing
         if self.is_processing:
-            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
+            QMessageBox.information(
+                self, "Processing", "Please wait for the current operation to complete."
+            )
             return
-            
+
         # Get all items
         items = []
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
-            items.append(item.data(Qt.UserRole))
+            media_item = item.data(Qt.UserRole)
+            items.append(media_item)
             
+        need_new_preview = self.check_pending_changes()
+            
+        if not need_new_preview and self.preview_all_cache["path"]:
+            if os.path.exists(self.preview_all_cache["path"]):
+                # Use cached preview
+                self.preview_file = self.preview_all_cache["path"]
+                self.status_label.setText("Playing: All items (cached)")
+                self.media_player.setMedia(
+                    QMediaContent(QUrl.fromLocalFile(self.preview_file))
+                )
+                self.media_player.play()
+                return
+
+        # Update timeline display
+        self.update_timeline()
+
         # Start processing
         self.is_processing = True
         self.status_label.setText("Creating full preview...")
-        
+
         # Create progress dialog
-        self.progress_dialog = QProgressDialog("Creating preview...", "Cancel", 0, 100, self)
+        self.progress_dialog = QProgressDialog(
+            "Creating preview...", "Cancel", 0, 100, self
+        )
         self.progress_dialog.setWindowTitle("Preview")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
         self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
         self.progress_dialog.setValue(0)
-        
-        # Set up processing thread
+
+        # Set up processing thread with music tracks
+        self.processing_thread.worker.music_tracks = self.music_tracks
+        if self.music_tracks and len(self.music_tracks) > 0:
+            # Set legacy music file for compatibility
+            self.processing_thread.worker.music_file = self.music_tracks[0].file_path
+            self.processing_thread.worker.music_volume = self.music_tracks[0].volume
+        else:
+            self.processing_thread.worker.music_file = None
+            
         self.processing_thread.setup_task("preview_all", [items])
-        
+
         # Start thread
         self.processing_thread.start()
-    
+
     def export(self):
         """Export the final compilation"""
         # Check if we have items
         if self.clip_list.count() == 0:
-            QMessageBox.information(self, "No Items", "Please add some media items first.")
+            QMessageBox.information(
+                self, "No Items", "Please add some media items first."
+            )
             return
-            
+
         # Check if already processing
         if self.is_processing:
-            QMessageBox.information(self, "Processing", "Please wait for the current operation to complete.")
+            QMessageBox.information(
+                self, "Processing", "Please wait for the current operation to complete."
+            )
             return
-            
+
         # Get output path
         output_path, _ = QFileDialog.getSaveFileName(
-            self, 
-            "Save Compilation", 
-            "", 
-            "Video Files (*.mp4)"
+            self, "Save Compilation", "", "Video Files (*.mp4)"
         )
-        
+
         if not output_path:
             return
-            
+
         # Ensure extension
-        if not output_path.lower().endswith('.mp4'):
-            output_path += '.mp4'
-            
+        if not output_path.lower().endswith(".mp4"):
+            output_path += ".mp4"
+
         # Get all items
         items = []
         for i in range(self.clip_list.count()):
             item = self.clip_list.item(i)
             items.append(item.data(Qt.UserRole))
-            
+
         # Create progress dialog
-        self.progress_dialog = QProgressDialog("Exporting video...", "Cancel", 0, 100, self)
+        self.progress_dialog = QProgressDialog(
+            "Exporting video...", "Cancel", 0, 100, self
+        )
         self.progress_dialog.setWindowTitle("Export")
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.canceled.connect(self.cancel_processing)
         self.progress_dialog.setMinimumDuration(400)  # Show after 400ms
         self.progress_dialog.setValue(0)
-        
+
         # Start processing
         self.is_processing = True
         self.status_label.setText("Exporting...")
-        
-        # Set up processing thread
+
+        # Set up processing thread with music tracks
+        self.processing_thread.worker.music_tracks = self.music_tracks
+        if self.music_tracks and len(self.music_tracks) > 0:
+            # Set legacy music file for compatibility
+            self.processing_thread.worker.music_file = self.music_tracks[0].file_path
+            self.processing_thread.worker.music_volume = self.music_tracks[0].volume
+        else:
+            self.processing_thread.worker.music_file = None
+            
         self.processing_thread.setup_task("export", [items, output_path])
-        
+
         # Start thread
         self.processing_thread.start()
+
+    def add_music(self):
+        """Add and edit background music tracks"""
+        # Calculate total video duration for the music editor
+        total_duration = 0
+        for i in range(self.clip_list.count()):
+            item = self.clip_list.item(i)
+            media_item = item.data(Qt.UserRole)
+
+            if media_item.is_image:
+                duration = media_item.display_duration
+            else:
+                duration = (
+                    media_item.end_time or media_item.duration
+                ) - media_item.start_time
+
+            total_duration += duration
+
+        # For backward compatibility, convert single music file to track if needed
+        if self.music_file and not self.music_tracks:
+            try:
+                track = MusicTrack(self.music_file, volume=self.music_volume)
+                self.music_tracks.append(track)
+            except Exception as e:
+                print(f"Error converting music file to track: {str(e)}")
+
+        # Show dialog
+        dialog = MusicEditorDialog(self, self.music_tracks, total_duration)
+        if dialog.exec_():
+            # Update tracks
+            old_tracks = self.music_tracks.copy()
+            self.music_tracks = dialog.music_tracks
+
+            # Check if tracks changed
+            tracks_changed = (len(old_tracks) != len(self.music_tracks))
+            if not tracks_changed:
+                for i, track in enumerate(self.music_tracks):
+                    if i >= len(old_tracks):
+                        tracks_changed = True
+                        break
+                    old_track = old_tracks[i]
+                    if (track.file_path != old_track.file_path or
+                        track.start_time_in_compilation != old_track.start_time_in_compilation or
+                        track.start_time_in_track != old_track.start_time_in_track or
+                        track.duration != old_track.duration or
+                        track.volume != old_track.volume):
+                        tracks_changed = True
+                        break
+
+            # Update processing thread
+            if self.music_tracks:
+                # Keep backward compatibility - use first track for simple cases
+                self.music_file = self.music_tracks[0].file_path
+                self.music_volume = self.music_tracks[0].volume
+                self.processing_thread.worker.music_file = self.music_file
+                self.processing_thread.worker.music_volume = self.music_volume
+
+                # Pass full tracks list
+                self.processing_thread.worker.music_tracks = self.music_tracks
+            else:
+                # No tracks - clear music
+                self.music_file = None
+                self.processing_thread.worker.music_file = None
+                self.processing_thread.worker.music_tracks = []
+
+            # Clear preview cache since music has changed
+            if tracks_changed:
+                self.preview_all_cache = {
+                    "signature": None,
+                    "path": None,
+                    "total_duration": 0,
+                }
+                self.has_pending_music_changes = True
+                self.check_pending_changes()
+
+            # Update status with count of music tracks
+            if len(self.music_tracks) == 0:
+                self.status_label.setText("No music tracks")
+            elif len(self.music_tracks) == 1:
+                self.status_label.setText(
+                    f"1 music track added: {os.path.basename(self.music_tracks[0].file_path)}"
+                )
+            else:
+                self.status_label.setText(
+                    f"{len(self.music_tracks)} music tracks added"
+                )
+            self.timeline.set_music_tracks(self.music_tracks)
+            self.timeline.update()
+
+    def update_timeline(self):
+        """Update the timeline visualization with current clips"""
+        if self.clip_list.count() == 0:
+            self.timeline.set_clips([])
+            return
+
+        # Prepare timeline data
+        timeline_clips = []
+        current_time = 0
+
+        for i in range(self.clip_list.count()):
+            item = self.clip_list.item(i)
+            media_item = item.data(Qt.UserRole)
+
+            # Calculate duration for timeline
+            if media_item.is_image:
+                duration = media_item.display_duration
+            else:
+                duration = (
+                    media_item.end_time or media_item.duration
+                ) - media_item.start_time
+
+            # Add to timeline data
+            timeline_clips.append(
+                {
+                    "name": os.path.basename(media_item.file_path),
+                    "duration": duration,
+                    "start_time": current_time,
+                    "is_image": media_item.is_image,
+                    "has_pending_changes": media_item.has_pending_changes,
+                }
+            )
+
+            current_time += duration
+
+        # Update timeline widget
+        self.timeline.set_clips(timeline_clips)
+        self.timeline.set_music_tracks(self.music_tracks)
+        self.timeline.update()
+
 
 # Add the main execution point at the end of the file
 if __name__ == "__main__":
@@ -2066,3 +4269,4 @@ if __name__ == "__main__":
     window = VideoCompilationEditor()
     window.show()
     sys.exit(app.exec_())
+    (app.exec_())
